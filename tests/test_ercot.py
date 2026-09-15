@@ -2233,6 +2233,122 @@ def test_get_hourly_resource_outage_capacity(client, monkeypatch):
 
 
 # =========================
+# NP3-107 Monthly Demand Response from ERS
+# =========================
+
+
+def _write_ers_dr_xlsx(path, rows):
+    """Write an NP3-107-style xlsx: similar structure to NP3-108."""
+    pd = pytest.importorskip("pandas")
+    cols = ["Month", "Hour", "Houston", "North", "South", "West"]
+
+    def build(data_rows):
+        return pd.DataFrame([[None] * 6] * 7 + [cols] + data_rows)
+
+    df = build(rows)
+    with pd.ExcelWriter(str(path)) as writer:
+        df.to_excel(writer, sheet_name="ERS Data", header=None, index=False)
+        pd.DataFrame([[None]]).to_excel(writer, sheet_name="Report Info", header=None, index=False)
+    return path
+
+
+ERS_DR_ROWS = [
+    ["JUL-26", 1, 100, 50, 75, 25],
+    ["JUL-26", 2, 95, 48, 70, 20],
+]
+
+
+def test_parse_ers_demand_response_xlsx(client, tmp_path):
+    xlsx = _write_ers_dr_xlsx(tmp_path / "ers_dr.xlsx", ERS_DR_ROWS)
+
+    rows = client._parse_ers_demand_response_xlsx(xlsx.read_bytes())
+
+    assert len(rows) == 2
+    assert rows[0] == {
+        "month": "JUL-26",
+        "hour": 1,
+        "houston": 100.0,
+        "north": 50.0,
+        "south": 75.0,
+        "west": 25.0,
+    }
+    assert rows[1]["month"] == "JUL-26"
+    assert rows[1]["hour"] == 2
+
+
+def test_get_monthly_demand_response_ers_from_archive(client, monkeypatch, tmp_path):
+    """Test NP3-107 retrieval when it becomes available through the archive endpoint."""
+    xlsx = _write_ers_dr_xlsx(tmp_path / "ers_dr.xlsx", ERS_DR_ROWS)
+    entries = [
+        {
+            "docId": 1,
+            "friendlyName": "Monthly_ERCOT_ERS_DR_26_07",
+            "postDatetime": "2026-08-04T08:00:56.000",
+        }
+    ]
+    monkeypatch.setattr(client, "get_archive_entries", lambda report_id: entries if report_id == "np3-107" else [])
+    monkeypatch.setattr(client, "download_archive", lambda report_id, doc_id: xlsx.read_bytes())
+
+    payload = client.get_monthly_demand_response_ers("2026-07")
+
+    assert payload is not None
+    assert payload["report"] == "np3-107"
+    assert payload["_meta"]["totalRecords"] == 2
+    assert payload["data"][0]["houston"] == 100.0
+
+
+def test_get_monthly_demand_response_ers_not_available(client, monkeypatch, caplog):
+    """Test NP3-107 returns None with error message when not available."""
+    monkeypatch.setattr(client, "get_archive_entries", lambda report_id: [])
+
+    with caplog.at_level(logging.ERROR):
+        result = client.get_monthly_demand_response_ers("2026-07")
+
+    assert result is None
+    assert "NP3-107" in caplog.text
+    assert "not available" in caplog.text
+
+
+def test_format_ers_demand_response_payload_empty(client):
+    """Test formatting an empty ERS DR payload."""
+    payload = client._format_ers_demand_response_payload([])
+
+    assert payload["report"] == "np3-107"
+    assert payload["_meta"]["totalRecords"] == 0
+    assert payload["data"] == []
+
+
+def test_format_ers_demand_response_payload_with_data(client):
+    """Test formatting ERS DR payload with actual data."""
+    rows = [
+        {"month": "JUL-26", "hour": 1, "houston": 100.0, "north": 50.0},
+        {"month": "JUL-26", "hour": 2, "houston": 95.0, "north": 48.0},
+    ]
+    payload = client._format_ers_demand_response_payload(rows)
+
+    assert payload["report"] == "np3-107"
+    assert payload["_meta"]["totalRecords"] == 2
+    assert len(payload["fields"]) == 4  # month, hour, houston, north
+    assert payload["data"] == rows
+
+
+def test_parse_ers_demand_response_xlsx_pandas_missing(client, monkeypatch, caplog):
+    """Test NP3-107 parsing fails gracefully without pandas."""
+    monkeypatch.setitem(sys.modules, "pandas", None)
+
+    with caplog.at_level(logging.ERROR):
+        assert client._parse_ers_demand_response_xlsx(b"x") == []
+    assert "pandas is required" in caplog.text
+
+
+def test_parse_ers_demand_response_xlsx_invalid_content(client, caplog):
+    """Test NP3-107 parsing handles invalid Excel content."""
+    with caplog.at_level(logging.ERROR):
+        assert client._parse_ers_demand_response_xlsx(b"garbage") == []
+    assert "Failed to read NP3-107 xlsx" in caplog.text
+
+
+# =========================
 # Persistence tests
 # =========================
 

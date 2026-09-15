@@ -1409,6 +1409,260 @@ class ERCOTClient:
         }
         return payload
 
+    def get_monthly_demand_response_ers(
+        self, month: DateLike, report_type_id: Optional[int] = None
+    ) -> Optional[Json]:
+        """Monthly ERCOT Demand Response from ERS (NP3-107).
+
+        **Note**: NP3-107 is not currently available through the ERCOT Public API's
+        archive endpoint (unlike NP3-108). This method attempts to retrieve the data
+        from the ERCOT MIS portal using the legacy document download service.
+
+        The report contains MWs of Demand Response participating in Emergency Response
+        Service (ERS) by Load Zone, as published under P.U.C. Subst. R. 25.361.
+
+        Parameters
+        ----------
+        month : DateLike
+            Any date within the month to retrieve (e.g., "2025-01-15" for January 2025)
+        report_type_id : int, optional
+            The ERCOT MIS reportTypeId for NP3-107. If not provided, the method will
+            attempt to discover it or return None if unavailable.
+
+        Returns
+        -------
+        Optional[Json]
+            Standard Report payload with fields:
+              month, hour, loadZone, ers_mw
+            Returns None if the report cannot be accessed.
+
+        Examples
+        --------
+        >>> client.get_monthly_demand_response_ers("2025-01-01")
+        {'_meta': {...}, 'data': [...]}
+        """
+        year, mon = self._as_year_month(month)
+
+        # Attempt 1: Try the public API archive endpoint (in case it becomes available)
+        entries = self.get_archive_entries("np3-107")
+        if entries:
+            suffix = f"_{year % 100:02d}_{mon:02d}"
+            matches = [e for e in entries if e.get("friendlyName", "").endswith(suffix)]
+            if matches:
+                matches.sort(key=lambda e: e.get("postDatetime", ""), reverse=True)
+                chosen = matches[0]
+                logger.info(
+                    f"Selected NP3-107 archive '{chosen.get('friendlyName')}' "
+                    f"(posted {chosen.get('postDatetime')})"
+                )
+                content = self.download_archive("np3-107", chosen.get("docId"))
+                if content:
+                    rows = self._parse_ers_demand_response_xlsx(content)
+                    if rows:
+                        return self._format_ers_demand_response_payload(rows)
+
+        # Attempt 2: Try the MIS portal if report_type_id is provided
+        if report_type_id:
+            content = self._download_from_mis_portal(
+                report_type_id, year, mon, pattern_keywords=["ERS", "Demand", "Response"]
+            )
+            if content:
+                rows = self._parse_ers_demand_response_xlsx(content)
+                if rows:
+                    return self._format_ers_demand_response_payload(rows)
+
+        logger.error(
+            f"NP3-107 (Monthly ERCOT Demand Response from ERS) is not available "
+            f"for {year:04d}-{mon:02d}. This report may require manual download from "
+            f"the ERCOT MIS portal at https://www.ercot.com/mp/data-products/data-product-details?id=np3-107"
+        )
+        return None
+
+    def _download_from_mis_portal(
+        self, report_type_id: int, year: int, month: int, pattern_keywords: List[str]
+    ) -> Optional[bytes]:
+        """Download a file from the ERCOT MIS portal by report type and date pattern.
+
+        Parameters
+        ----------
+        report_type_id : int
+            The ERCOT MIS reportTypeId
+        year : int
+            Four-digit year
+        month : int
+            Month (1-12)
+        pattern_keywords : List[str]
+            Keywords to match in the friendly name
+
+        Returns
+        -------
+        Optional[bytes]
+            File content if found and downloaded, None otherwise
+        """
+        url = f"https://www.ercot.com/misapp/servlets/IceDocListJsonWS"
+        try:
+            resp = self.session.get(
+                url, params={"reportTypeId": report_type_id}, timeout=self.config.timeout
+            )
+            if resp.status_code != 200:
+                logger.debug(f"MIS portal returned {resp.status_code} for reportTypeId={report_type_id}")
+                return None
+
+            data = resp.json()
+            doc_list = data.get("ListDocsByRptTypeRes", {}).get("DocumentList", [])
+            if not doc_list:
+                return None
+
+            # Search for matching document
+            year_short = year % 100
+            month_patterns = [f"_{year_short:02d}_{month:02d}", f"{year_short:02d}_{month:02d}"]
+
+            for doc_wrapper in doc_list:
+                doc = doc_wrapper.get("Document", {})
+                friendly_name = doc.get("FriendlyName", "")
+
+                # Check if name matches our date pattern and keywords
+                if any(pattern in friendly_name for pattern in month_patterns):
+                    if all(kw.lower() in friendly_name.lower() for kw in pattern_keywords):
+                        doc_id = doc.get("DocID")
+                        if not doc_id:
+                            continue
+
+                        logger.info(f"Found NP3-107 file in MIS portal: {friendly_name}")
+
+                        # Download the document
+                        download_url = "https://www.ercot.com/misdownload/servlets/mirDownload"
+                        dl_resp = self.session.get(
+                            download_url,
+                            params={"dDocName": doc_id},
+                            timeout=self.config.timeout,
+                        )
+                        if dl_resp.status_code == 200:
+                            return dl_resp.content
+
+        except Exception as e:
+            logger.debug(f"MIS portal download failed: {e}")
+
+        return None
+
+    def _parse_ers_demand_response_xlsx(self, content: bytes) -> List[Json]:
+        """Parse the NP3-107 xlsx (ERS Demand Response) into dict rows.
+
+        Expected structure (based on NP3-108 pattern):
+          - Sheet with header row containing: Month, Hour, Load Zone columns
+          - Data rows with ERS MW values by load zone
+
+        Parameters
+        ----------
+        content : bytes
+            Excel file content
+
+        Returns
+        -------
+        List[Json]
+            Parsed rows as dicts
+        """
+        try:
+            import io
+            import pandas as pd
+        except ImportError:
+            logger.error("pandas is required to read NP3-107 archive files.")
+            return []
+
+        try:
+            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
+        except Exception as e:
+            logger.error(f"Failed to read NP3-107 xlsx: {e}")
+            return []
+
+        rows: List[Json] = []
+
+        # Try to find the data sheet (similar pattern to NP3-108)
+        for sheet_name, df in sheets.items():
+            sheet = str(sheet_name)
+
+            # Skip info sheets
+            if "Info" in sheet or df.shape[0] <= 8:
+                continue
+
+            # Look for header row (typically around row 7-8 like NP3-108)
+            header_row_idx = None
+            for idx in range(min(10, df.shape[0])):
+                row_values = df.iloc[idx].tolist()
+                row_str = " ".join(str(v).upper() for v in row_values if pd.notna(v))
+
+                # Check if this looks like a header row
+                if "MONTH" in row_str and "HOUR" in row_str:
+                    header_row_idx = idx
+                    break
+
+            if header_row_idx is None:
+                continue
+
+            # Extract header and data
+            header = [str(col).strip() for col in df.iloc[header_row_idx].tolist()]
+            body = df.iloc[header_row_idx + 1 :].copy()
+            body.columns = header
+
+            # Parse rows
+            for _, rec in body.iterrows():
+                if pd.isna(rec.get("Month")) or pd.isna(rec.get("Hour")):
+                    continue
+
+                # Build base row
+                row: Json = {
+                    "month": str(rec.get("Month")).strip(),
+                    "hour": int(rec.get("Hour")),
+                }
+
+                # Add load zone columns (expecting Houston, North, South, West, etc.)
+                # The exact column names may vary, so we'll be flexible
+                load_zones = ["Houston", "North", "South", "West", "Coast", "East", "FarWest", "NorthC", "SouthC"]
+                for zone in load_zones:
+                    if zone in header:
+                        row[zone.lower()] = self._clean_mw(rec.get(zone))
+
+                # Only add rows that have at least one non-null MW value
+                if any(v is not None for k, v in row.items() if k not in ("month", "hour")):
+                    rows.append(row)
+
+        return rows
+
+    def _format_ers_demand_response_payload(self, rows: List[Json]) -> Json:
+        """Format parsed ERS demand response rows into standard Report payload."""
+        if not rows:
+            return {
+                "_meta": {"totalRecords": 0, "totalPages": 1, "currentPage": 1, "pageSize": 0},
+                "report": "np3-107",
+                "fields": [],
+                "data": [],
+                "links": [],
+            }
+
+        # Determine which load zone columns are present
+        sample_row = rows[0]
+        zone_columns = [k for k in sample_row.keys() if k not in ("month", "hour")]
+
+        fields: List[Json] = [
+            {"name": "month", "dataType": "VARCHAR"},
+            {"name": "hour", "dataType": "INTEGER"},
+        ]
+        for zone in zone_columns:
+            fields.append({"name": zone, "dataType": "DOUBLE"})
+
+        return {
+            "_meta": {
+                "totalRecords": len(rows),
+                "totalPages": 1,
+                "currentPage": 1,
+                "pageSize": len(rows),
+            },
+            "report": "np3-107",
+            "fields": tuple(fields),
+            "data": rows,
+            "links": [],
+        }
+
     def _parse_demand_response_xlsx(self, content: bytes) -> List[Json]:
         """Parse the NP3-108 xlsx (CLR/NCLR "Report Data" sheets) into dict rows."""
         try:
