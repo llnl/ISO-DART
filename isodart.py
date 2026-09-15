@@ -992,12 +992,30 @@ def handle_ercot(args):
             return _save(payload, "hourly_resource_outage_capacity")
 
         elif args.data_type == "demand-response":
-            logger.info(
-                f"Downloading ERCOT monthly demand response "
-                f"for {args.start.year}-{args.start.month:02d}..."
-            )
-            payload = client.get_monthly_demand_response(args.start)
-            return _save(payload, "demand_response")
+            # DR types: load_resources (NP3-108), ers (NP3-107)
+            dr_type = getattr(args, "dr_type", "load_resources")
+
+            if dr_type == "load_resources":
+                logger.info(
+                    f"Downloading ERCOT monthly demand response from load resources (NP3-108) "
+                    f"for {args.start.year}-{args.start.month:02d}..."
+                )
+                payload = client.get_monthly_demand_response(args.start)
+                return _save(payload, "demand_response_load_resources")
+
+            elif dr_type == "ers":
+                logger.info(
+                    f"Downloading ERCOT monthly demand response from ERS (NP3-107) "
+                    f"for {args.start.year}-{args.start.month:02d}..."
+                )
+                report_type_id = getattr(args, "report_type_id", None)
+                payload = client.get_monthly_demand_response_ers(args.start, report_type_id)
+                return _save(payload, "demand_response_ers")
+
+            else:
+                logger.error(f"Invalid ERCOT demand response type: {dr_type}")
+                logger.info("Available ERCOT DR types: load_resources, ers")
+                return False
 
         else:
             logger.error(f"Unknown ERCOT data type: {args.data_type}")
@@ -1252,6 +1270,12 @@ Examples:
 
   # ERCOT actual system load by forecast zone
   python isodart.py --iso ercot --data-type load --load-type forecast_zone --start 2024-01-01 --duration 7
+
+  # ERCOT monthly demand response from load resources (NP3-108)
+  python isodart.py --iso ercot --data-type demand-response --start 2026-01-01 --duration 1
+
+  # ERCOT monthly demand response from ERS (NP3-107) - if available
+  python isodart.py --iso ercot --data-type demand-response --dr-type ers --start 2026-01-01 --duration 1
         """,
     )
 
@@ -1522,6 +1546,25 @@ Examples:
         help=(
             "For ERCOT ancillary services: service product code "
             "(e.g., REGUP, REGDN, NSPIN, ECRSM, RRSPFR)"
+        ),
+    )
+
+    parser.add_argument(
+        "--dr-type",
+        choices=["load_resources", "ers"],
+        default="load_resources",
+        help=(
+            "For ERCOT demand-response: type of DR data to download. "
+            "load_resources=NP3-108 (available), ers=NP3-107 (limited availability)"
+        ),
+    )
+
+    parser.add_argument(
+        "--report-type-id",
+        type=int,
+        help=(
+            "For ERCOT demand-response with --dr-type ers: MIS portal report type ID "
+            "(optional, only needed if you have MIS portal access)"
         ),
     )
 

@@ -1505,7 +1505,9 @@ class ERCOTClient:
                 url, params={"reportTypeId": report_type_id}, timeout=self.config.timeout
             )
             if resp.status_code != 200:
-                logger.debug(f"MIS portal returned {resp.status_code} for reportTypeId={report_type_id}")
+                logger.debug(
+                    f"MIS portal returned {resp.status_code} for reportTypeId={report_type_id}"
+                )
                 return None
 
             data = resp.json()
@@ -1617,7 +1619,17 @@ class ERCOTClient:
 
                 # Add load zone columns (expecting Houston, North, South, West, etc.)
                 # The exact column names may vary, so we'll be flexible
-                load_zones = ["Houston", "North", "South", "West", "Coast", "East", "FarWest", "NorthC", "SouthC"]
+                load_zones = [
+                    "Houston",
+                    "North",
+                    "South",
+                    "West",
+                    "Coast",
+                    "East",
+                    "FarWest",
+                    "NorthC",
+                    "SouthC",
+                ]
                 for zone in load_zones:
                     if zone in header:
                         row[zone.lower()] = self._clean_mw(rec.get(zone))

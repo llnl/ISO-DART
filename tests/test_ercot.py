@@ -2286,7 +2286,9 @@ def test_get_monthly_demand_response_ers_from_archive(client, monkeypatch, tmp_p
             "postDatetime": "2026-08-04T08:00:56.000",
         }
     ]
-    monkeypatch.setattr(client, "get_archive_entries", lambda report_id: entries if report_id == "np3-107" else [])
+    monkeypatch.setattr(
+        client, "get_archive_entries", lambda report_id: entries if report_id == "np3-107" else []
+    )
     monkeypatch.setattr(client, "download_archive", lambda report_id, doc_id: xlsx.read_bytes())
 
     payload = client.get_monthly_demand_response_ers("2026-07")
