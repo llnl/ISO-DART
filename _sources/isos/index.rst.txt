@@ -1,12 +1,13 @@
 ISO Coverage
 ============
 
-ISO-DART supports seven Independent System Operators across the United States.
+ISO-DART supports eight Independent System Operators across the United States.
 
 .. toctree::
    :maxdepth: 1
 
    caiso/index
+   ercot/index
    miso/index
    nyiso/index
    spp/index
