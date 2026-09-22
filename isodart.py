@@ -1017,9 +1017,103 @@ def handle_ercot(args):
                 logger.info("Available ERCOT DR types: load_resources, ers")
                 return False
 
+        elif args.data_type == "generation":
+            # Generation types: wind, solar, fuel_mix, unplanned_outages
+            gen_type = getattr(args, "gen_type", "fuel_mix")
+
+            if gen_type == "wind":
+                logger.info("Downloading ERCOT wind power production...")
+                payload = client.get_wind_power_production(args.start, end_date)
+                return _save(payload, "wind_power_production")
+
+            elif gen_type == "solar":
+                logger.info("Downloading ERCOT solar power production...")
+                payload = client.get_solar_power_production(args.start, end_date)
+                return _save(payload, "solar_power_production")
+
+            elif gen_type == "fuel_mix":
+                logger.info("Downloading ERCOT fuel mix (5-minute intervals)...")
+                payload = client.get_fuel_mix(args.start, end_date)
+                return _save(payload, "fuel_mix")
+
+            elif gen_type == "unplanned_outages":
+                logger.info("Downloading ERCOT unplanned resource outages...")
+                # Convert date to datetime for timestamp parameter
+                start_dt = datetime.combine(args.start, datetime.min.time())
+                end_dt = datetime.combine(end_date, datetime.max.time())
+                payload = client.get_unplanned_resource_outages(start_dt, end_dt)
+                return _save(payload, "unplanned_resource_outages")
+
+            else:
+                logger.error(f"Invalid ERCOT generation type: {gen_type}")
+                logger.info(
+                    "Available ERCOT generation types: wind, solar, fuel_mix, unplanned_outages"
+                )
+                return False
+
+        elif args.data_type == "system-operations":
+            # System ops types: lambda, load_vs_forecast, dam_60d_prices
+            ops_type = getattr(args, "ops_type", "lambda")
+
+            if ops_type == "lambda":
+                logger.info("Downloading ERCOT actual system lambda...")
+                # Convert date to datetime for timestamp parameter
+                start_dt = datetime.combine(args.start, datetime.min.time())
+                end_dt = datetime.combine(end_date, datetime.max.time())
+                payload = client.get_actual_system_lambda(start_dt, end_dt)
+                return _save(payload, "actual_system_lambda")
+
+            elif ops_type == "load_vs_forecast":
+                logger.info("Downloading ERCOT actual load vs forecast...")
+                payload = client.get_system_wide_actual_load_vs_forecast(args.start, end_date)
+                return _save(payload, "load_vs_forecast")
+
+            elif ops_type == "dam_60d_prices":
+                logger.info("Downloading ERCOT 60-day DAM settlement point prices...")
+                sp_params = {"settlementPoint": settlement_point} if settlement_point else None
+                payload = client.get_dam_60day_settlement_point_price(
+                    args.start, end_date, settlement_point=settlement_point
+                )
+                return _save(payload, "dam_60d_settlement_point_prices")
+
+            else:
+                logger.error(f"Invalid ERCOT system operations type: {ops_type}")
+                logger.info(
+                    "Available ERCOT system ops types: lambda, load_vs_forecast, dam_60d_prices"
+                )
+                return False
+
+        elif args.data_type == "transmission":
+            # Transmission types: dc_ties, binding_constraints
+            trans_type = getattr(args, "trans_type", "dc_ties")
+
+            if trans_type == "dc_ties":
+                logger.info("Downloading ERCOT DC tie flows...")
+                # Convert date to datetime for timestamp parameter
+                start_dt = datetime.combine(args.start, datetime.min.time())
+                end_dt = datetime.combine(end_date, datetime.max.time())
+                payload = client.get_dc_tie_flows(start_dt, end_dt)
+                return _save(payload, "dc_tie_flows")
+
+            elif trans_type == "binding_constraints":
+                logger.info("Downloading ERCOT SCED binding transmission constraints...")
+                # Convert date to datetime for timestamp parameter
+                start_dt = datetime.combine(args.start, datetime.min.time())
+                end_dt = datetime.combine(end_date, datetime.max.time())
+                payload = client.get_sced_binding_transmission_constraints(start_dt, end_dt)
+                return _save(payload, "binding_transmission_constraints")
+
+            else:
+                logger.error(f"Invalid ERCOT transmission type: {trans_type}")
+                logger.info("Available ERCOT transmission types: dc_ties, binding_constraints")
+                return False
+
         else:
             logger.error(f"Unknown ERCOT data type: {args.data_type}")
-            logger.info("Available types: lmp, load, ancillary-services, outages, demand-response")
+            logger.info(
+                "Available types: lmp, load, ancillary-services, outages, demand-response, "
+                "generation, system-operations, transmission"
+            )
             return False
 
     except Exception as e:

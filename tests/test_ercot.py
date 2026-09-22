@@ -2302,6 +2302,8 @@ def test_get_monthly_demand_response_ers_from_archive(client, monkeypatch, tmp_p
 def test_get_monthly_demand_response_ers_not_available(client, monkeypatch, caplog):
     """Test NP3-107 returns None with error message when not available."""
     monkeypatch.setattr(client, "get_archive_entries", lambda report_id: [])
+    monkeypatch.setattr(client, "_download_from_mis_portal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(client, "_download_from_data_product_page", lambda *args, **kwargs: None)
 
     with caplog.at_level(logging.ERROR):
         result = client.get_monthly_demand_response_ers("2026-07")
@@ -2348,6 +2350,461 @@ def test_parse_ers_demand_response_xlsx_invalid_content(client, caplog):
     with caplog.at_level(logging.ERROR):
         assert client._parse_ers_demand_response_xlsx(b"garbage") == []
     assert "Failed to read NP3-107 xlsx" in caplog.text
+
+
+def test_get_monthly_demand_response_ers_from_mis_portal(client, monkeypatch, tmp_path):
+    """Test NP3-107 retrieval via MIS portal fallback."""
+    monkeypatch.setattr(client, "get_archive_entries", lambda report_id: [])
+    xlsx = _write_ers_dr_xlsx(tmp_path / "ers_dr_mis.xlsx", ERS_DR_ROWS)
+    monkeypatch.setattr(
+        client, "_download_from_mis_portal", lambda *args, **kwargs: xlsx.read_bytes()
+    )
+    payload = client.get_monthly_demand_response_ers("2026-07")
+    assert payload is not None
+    assert payload["report"] == "np3-107"
+    assert len(payload["data"]) == 2
+
+
+def test_get_monthly_demand_response_ers_from_data_product_page(client, monkeypatch, tmp_path):
+    """Test NP3-107 retrieval via data product page scraping fallback."""
+    monkeypatch.setattr(client, "get_archive_entries", lambda report_id: [])
+    monkeypatch.setattr(client, "_download_from_mis_portal", lambda *args, **kwargs: None)
+    xlsx = _write_ers_dr_xlsx(tmp_path / "ers_dr_page.xlsx", ERS_DR_ROWS)
+    monkeypatch.setattr(
+        client, "_download_from_data_product_page", lambda *args, **kwargs: xlsx.read_bytes()
+    )
+    payload = client.get_monthly_demand_response_ers("2026-07")
+    assert payload is not None
+    assert payload["report"] == "np3-107"
+    assert len(payload["data"]) == 2
+
+
+def test_download_from_mis_portal_not_found(client, monkeypatch):
+    """Test MIS portal download when report not found."""
+
+    def fake_get(*args, **kwargs):
+        return FakeResponse(200, {"ListDocsByRptTypeRes": {"DocumentList": []}})
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_mis_portal(12345, 2026, 7, [])
+    assert result is None
+
+
+def test_download_from_mis_portal_http_error(client, monkeypatch):
+    """Test MIS portal download when HTTP request fails."""
+
+    def fake_get(*args, **kwargs):
+        return FakeResponse(404, {})
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_mis_portal(12345, 2026, 7, [])
+    assert result is None
+
+
+def test_download_from_mis_portal_small_content(client, monkeypatch):
+    """Test MIS portal download when content is too small (invalid)."""
+
+    class FakeResponseWithContent(FakeResponse):
+        @property
+        def content(self):
+            return getattr(self, "_content", b"")
+
+    call_count = [0]
+
+    def fake_get(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            resp = FakeResponseWithContent(
+                200,
+                {
+                    "ListDocsByRptTypeRes": {
+                        "DocumentList": [
+                            {
+                                "Document": {
+                                    "FriendlyName": "Monthly_ERCOT_ERS_DR_26_07.xlsx",
+                                    "DocID": "12345",
+                                }
+                            }
+                        ]
+                    }
+                },
+            )
+            return resp
+        resp = FakeResponseWithContent(200, {})
+        resp._content = b"tiny"
+        return resp
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_mis_portal(12345, 2026, 7, [])
+    assert result is None
+
+
+def test_download_from_mis_portal_exception(client, monkeypatch, caplog):
+    """Test MIS portal download when exception occurs."""
+
+    def fake_get(*args, **kwargs):
+        raise Exception("Network error")
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    with caplog.at_level(logging.DEBUG):
+        result = client._download_from_mis_portal(12345, 2026, 7, [])
+    assert result is None
+    assert "MIS portal download failed" in caplog.text
+
+
+def test_download_from_data_product_page_http_error(client, monkeypatch):
+    """Test data product page download when HTTP request fails."""
+
+    def fake_get(*args, **kwargs):
+        return FakeResponse(404, {})
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_data_product_page("np3-107", 2026, 7)
+    assert result is None
+
+
+def test_download_from_data_product_page_no_link_found(client, monkeypatch):
+    """Test data product page download when no download link found in HTML."""
+
+    def fake_get(*args, **kwargs):
+        resp = FakeResponse(200, {})
+        resp.text = "<html><body>No download links here</body></html>"
+        return resp
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_data_product_page("np3-107", 2026, 7)
+    assert result is None
+
+
+def test_download_from_data_product_page_relative_url(client, monkeypatch):
+    """Test data product page download with relative URL."""
+
+    class FakeResponseWithContent(FakeResponse):
+        @property
+        def content(self):
+            return getattr(self, "_content", b"")
+
+    call_count = [0]
+    download_content = b"fake xlsx content with sufficient length to pass checks" * 50
+
+    def fake_get(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            resp = FakeResponseWithContent(200, {})
+            resp.text = (
+                '<html><a href="/download/Monthly_ERCOT_ERS_DR_26_07.xlsx">Download</a></html>'
+            )
+            return resp
+        resp = FakeResponseWithContent(200, {})
+        resp._content = download_content
+        return resp
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_data_product_page("np3-107", 2026, 7)
+    assert result == download_content
+
+
+def test_download_from_data_product_page_non_http_url(client, monkeypatch):
+    """Test data product page download with non-http relative URL."""
+
+    class FakeResponseWithContent(FakeResponse):
+        @property
+        def content(self):
+            return getattr(self, "_content", b"")
+
+    call_count = [0]
+    download_content = b"fake xlsx content with sufficient length" * 50
+
+    def fake_get(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            resp = FakeResponseWithContent(200, {})
+            resp.text = '<html><a href="misdownload/servlets/mirDownload?docId=ERS_26_07">Download</a></html>'
+            return resp
+        resp = FakeResponseWithContent(200, {})
+        resp._content = download_content
+        return resp
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_data_product_page("np3-107", 2026, 7)
+    assert result == download_content
+
+
+def test_download_from_data_product_page_download_fails(client, monkeypatch, caplog):
+    """Test data product page download when file download fails."""
+    call_count = [0]
+
+    def fake_get(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            resp = FakeResponse(200, {})
+            resp.text = (
+                '<html><a href="/download/Monthly_ERCOT_ERS_DR_26_07.xlsx">Download</a></html>'
+            )
+            return resp
+        return FakeResponse(500, {})
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    with caplog.at_level(logging.DEBUG):
+        result = client._download_from_data_product_page("np3-107", 2026, 7)
+    assert result is None
+    assert "Download failed" in caplog.text
+
+
+def test_download_from_data_product_page_exception(client, monkeypatch, caplog):
+    """Test data product page download when exception occurs."""
+
+    def fake_get(*args, **kwargs):
+        raise Exception("Connection error")
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    with caplog.at_level(logging.DEBUG):
+        result = client._download_from_data_product_page("np3-107", 2026, 7)
+    assert result is None
+    assert "scraping failed" in caplog.text
+
+
+def test_parse_ers_demand_response_xlsx_new_format(client, tmp_path):
+    """Test parsing NP3-107 XLSX (must have 9+ rows, headers with MONTH/HOUR)."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    # Need 9+ rows total to pass the row count check
+    for i in range(6):  # Add some filler rows before header
+        ws.append([])
+    ws.append(["Month", "Hour", "Houston", "North", "South", "West"])  # Header row
+    ws.append(["JUL-26", 1, 50.0, 40.0, 30.0, 20.0])
+    ws.append(["JUL-26", 2, 60.0, 50.0, 40.0, 30.0])
+    xlsx_path = tmp_path / "new_format.xlsx"
+    wb.save(str(xlsx_path))
+    rows = client._parse_ers_demand_response_xlsx(xlsx_path.read_bytes())
+    assert len(rows) == 2
+    assert rows[0]["month"] == "JUL-26"
+    assert rows[0]["hour"] == 1
+    assert rows[0]["houston"] == 50.0
+
+
+def test_parse_ers_demand_response_xlsx_skip_invalid_rows(client, tmp_path):
+    """Test parsing XLSX skips rows with missing Month or Hour."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    # Need 9+ rows total
+    for i in range(5):
+        ws.append([])
+    ws.append(["Month", "Hour", "Houston", "North", "South", "West"])
+    ws.append(["JUL-26", 1, 100, 90, 80, 70])
+    ws.append([None, 2, 50, 40, 30, 20])  # Missing Month - should be skipped
+    ws.append(["AUG-26", None, 75, 65, 55, 45])  # Missing Hour - should be skipped
+    ws.append([None, None, 25, 20, 15, 10])  # Missing both - should be skipped
+    ws.append(["AUG-26", 3, 120, 110, 100, 90])
+    xlsx_path = tmp_path / "with_invalid.xlsx"
+    wb.save(str(xlsx_path))
+    rows = client._parse_ers_demand_response_xlsx(xlsx_path.read_bytes())
+    # Only 2 valid rows should be parsed
+    assert len(rows) == 2
+    assert rows[0]["month"] == "JUL-26"
+    assert rows[1]["month"] == "AUG-26"
+
+
+def test_parse_ers_demand_response_xlsx_no_header_found(client, tmp_path):
+    """Test parsing XLSX when no header row found (line 1732)."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    # Add 9 rows but none with MONTH/HOUR headers
+    for i in range(10):
+        ws.append(["Some", "Random", "Data", "Here"])
+    xlsx_path = tmp_path / "no_header.xlsx"
+    wb.save(str(xlsx_path))
+    rows = client._parse_ers_demand_response_xlsx(xlsx_path.read_bytes())
+    # Should return empty list when no header found
+    assert rows == []
+
+
+def test_download_from_mis_portal_no_matching_doc(client, monkeypatch):
+    """Test MIS portal when document found but doesn't match pattern (line 1571)."""
+
+    def fake_get(*args, **kwargs):
+        return FakeResponse(
+            200,
+            {
+                "ListDocsByRptTypeRes": {
+                    "DocumentList": [
+                        {"Document": {"FriendlyName": "Some_Other_File_26_07.xlsx", "DocID": "999"}}
+                    ]
+                }
+            },
+        )
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_mis_portal(12345, 2026, 7, ["ERS", "Demand"])
+    assert result is None
+
+
+def test_download_from_mis_portal_missing_doc_id(client, monkeypatch):
+    """Test MIS portal when document lacks DocID field (line 1571)."""
+
+    def fake_get(*args, **kwargs):
+        return FakeResponse(
+            200,
+            {
+                "ListDocsByRptTypeRes": {
+                    "DocumentList": [
+                        {
+                            "Document": {
+                                "FriendlyName": "Monthly_ERCOT_ERS_DR_26_07.xlsx"
+                            }  # No DocID
+                        }
+                    ]
+                }
+            },
+        )
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_mis_portal(12345, 2026, 7, ["ERS"])
+    assert result is None
+
+
+def test_download_from_mis_portal_download_failure_logged(client, monkeypatch, caplog):
+    """Test MIS portal logs debug when download returns small content (line 1586)."""
+
+    class FakeResponseWithContent(FakeResponse):
+        @property
+        def content(self):
+            return getattr(self, "_content", b"")
+
+    call_count = [0]
+
+    def fake_get(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            resp = FakeResponseWithContent(
+                200,
+                {
+                    "ListDocsByRptTypeRes": {
+                        "DocumentList": [
+                            {
+                                "Document": {
+                                    "FriendlyName": "Monthly_ERCOT_ERS_DR_26_07.xlsx",
+                                    "DocID": "123",
+                                }
+                            }
+                        ]
+                    }
+                },
+            )
+            return resp
+        resp = FakeResponseWithContent(200, {})
+        resp._content = b"x" * 500  # Content <1000 bytes
+        return resp
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    with caplog.at_level(logging.DEBUG):
+        result = client._download_from_mis_portal(12345, 2026, 7, ["ERS"])
+
+    assert result is None
+    assert "Download attempt failed or returned small/empty content" in caplog.text
+
+
+def test_download_from_mis_portal_success(client, monkeypatch):
+    """Test MIS portal successful download (line 1583)."""
+
+    class FakeResponseWithContent(FakeResponse):
+        @property
+        def content(self):
+            return getattr(self, "_content", b"")
+
+    valid_content = b"x" * 2000  # Content >1000 bytes
+    call_count = [0]
+
+    def fake_get(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # First call: list documents
+            resp = FakeResponseWithContent(
+                200,
+                {
+                    "ListDocsByRptTypeRes": {
+                        "DocumentList": [
+                            {
+                                "Document": {
+                                    "FriendlyName": "Monthly_ERCOT_ERS_DR_26_07.xlsx",
+                                    "DocID": "12345",
+                                }
+                            }
+                        ]
+                    }
+                },
+            )
+            return resp
+        # Second call: download the document
+        resp = FakeResponseWithContent(200, {})
+        resp._content = valid_content
+        return resp
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    result = client._download_from_mis_portal(12345, 2026, 7, ["ERS"])
+
+    assert result == valid_content  # Should return the content
+
+
+def test_parse_demand_response_xlsx_new_format(client, tmp_path):
+    """Test NP3-108 new format detection (lines 1841, 1845-1855)."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Report Data"  # Must have "Report Data" in name
+    ws.append([])  # Row 0
+    ws.append([])  # Row 1
+    # Row 2: Headers (triggers new format detection)
+    ws.append(["Month", "Hour", "ASType", "Houston", "North", "South", "West"])
+    # Row 3+: Data
+    ws.append(["JAN-26", 1, "RRS", 100.0, 90.0, 80.0, 70.0])
+    ws.append(["JAN-26", 2, "NSPIN", 110.0, 95.0, 85.0, 75.0])
+    ws.append([None, 3, "ECRS", 50.0, 40.0, 30.0, 20.0])  # Missing Month - should skip
+
+    xlsx_path = tmp_path / "np3_108_new.xlsx"
+    wb.save(str(xlsx_path))
+
+    rows = client._parse_demand_response_xlsx(xlsx_path.read_bytes())
+
+    # Should parse 2 valid rows (skip the one with None Month)
+    assert len(rows) == 2
+    assert rows[0]["month"] == "JAN-26"
+    assert rows[0]["hour"] == 1
+    assert rows[0]["asType"] == "RRS"
+    assert rows[0]["houston"] == 100.0
+    assert rows[0]["resourceType"] == "COMBINED"
+    assert rows[1]["hour"] == 2
+
+
+def test_parse_demand_response_xlsx_new_format_too_few_rows(client, tmp_path):
+    """Test NP3-108 new format with <=3 rows (line 1845-1846)."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Report Data"
+    ws.append([])
+    ws.append([])
+    ws.append(["Month", "Hour", "ASType", "Houston", "North", "South", "West"])
+    # Only 3 rows total, no data rows - should be skipped
+
+    xlsx_path = tmp_path / "np3_108_short.xlsx"
+    wb.save(str(xlsx_path))
+
+    rows = client._parse_demand_response_xlsx(xlsx_path.read_bytes())
+
+    # Should return empty because df.shape[0] <= 3
+    assert rows == []
 
 
 # =========================
@@ -2404,6 +2861,242 @@ def test_cleanup(client):
     assert client.session is not None
     client.cleanup()
     assert client.session is not None  # close() doesn't drop the object, just must not raise
+
+
+# =========================
+# Generation methods tests
+# =========================
+
+
+def test_get_wind_power_production(client, monkeypatch):
+    """Test get_wind_power_production calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload([{"deliveryDate": "2025-08-01", "generation": 1500}])
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    result = client.get_wind_power_production(date(2025, 8, 1), date(2025, 8, 2))
+
+    assert called_args["report_path"] == "np4-732-cd/wind_power_production_hourly_averaged_actual"
+    assert called_args["kwargs"]["from_param"] == "deliveryDateFrom"
+    assert called_args["kwargs"]["to_param"] == "deliveryDateTo"
+    assert called_args["kwargs"]["param_format"] == "date"
+    assert result["data"][0]["generation"] == 1500
+
+
+def test_get_solar_power_production(client, monkeypatch):
+    """Test get_solar_power_production calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload([{"deliveryDate": "2025-08-01", "generation": 800}])
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    result = client.get_solar_power_production(date(2025, 8, 1), date(2025, 8, 2))
+
+    assert called_args["report_path"] == "np4-737-cd/solar_power_production_hourly_averaged_actual"
+    assert called_args["kwargs"]["from_param"] == "deliveryDateFrom"
+    assert called_args["kwargs"]["to_param"] == "deliveryDateTo"
+    assert called_args["kwargs"]["param_format"] == "date"
+    assert result["data"][0]["generation"] == 800
+
+
+def test_get_fuel_mix(client, monkeypatch):
+    """Test get_fuel_mix calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload(
+            [
+                {"fuelType": "Natural Gas", "generation": 25000},
+                {"fuelType": "Wind", "generation": 18000},
+            ]
+        )
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    result = client.get_fuel_mix(date(2025, 8, 1), date(2025, 8, 1))
+
+    assert called_args["report_path"] == "np6-785-er/fuel_mix"
+    assert called_args["kwargs"]["from_param"] == "deliveryDateFrom"
+    assert called_args["kwargs"]["to_param"] == "deliveryDateTo"
+    assert called_args["kwargs"]["param_format"] == "date"
+    assert len(result["data"]) == 2
+
+
+def test_get_unplanned_resource_outages(client, monkeypatch):
+    """Test get_unplanned_resource_outages calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload(
+            [{"fuelType": "Gas", "outageMW": 500}, {"fuelType": "Coal", "outageMW": 300}]
+        )
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    start_dt = datetime(2025, 8, 1, 0, 0, 0)
+    end_dt = datetime(2025, 8, 1, 23, 59, 59)
+    result = client.get_unplanned_resource_outages(start_dt, end_dt)
+
+    assert called_args["report_path"] == "np3-233-cd/unplanned_resource_outages"
+    assert called_args["kwargs"]["from_param"] == "SCEDTimestampFrom"
+    assert called_args["kwargs"]["to_param"] == "SCEDTimestampTo"
+    assert called_args["kwargs"]["param_format"] == "timestamp"
+    assert len(result["data"]) == 2
+
+
+# =========================
+# System Operations tests
+# =========================
+
+
+def test_get_actual_system_lambda(client, monkeypatch):
+    """Test get_actual_system_lambda calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload([{"scedTimestamp": "2025-08-01T00:00:00", "systemLambda": 25.5}])
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    start_dt = datetime(2025, 8, 1, 0, 0, 0)
+    end_dt = datetime(2025, 8, 1, 23, 59, 59)
+    result = client.get_actual_system_lambda(start_dt, end_dt)
+
+    assert called_args["report_path"] == "np6-905-cd/actual_system_lambda"
+    assert called_args["kwargs"]["from_param"] == "SCEDTimestampFrom"
+    assert called_args["kwargs"]["to_param"] == "SCEDTimestampTo"
+    assert called_args["kwargs"]["param_format"] == "timestamp"
+    assert result["data"][0]["systemLambda"] == 25.5
+
+
+def test_get_system_wide_actual_load_vs_forecast(client, monkeypatch):
+    """Test get_system_wide_actual_load_vs_forecast calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload(
+            [{"deliveryDate": "2025-08-01", "actualLoad": 60000, "forecastLoad": 59500}]
+        )
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    result = client.get_system_wide_actual_load_vs_forecast(date(2025, 8, 1), date(2025, 8, 2))
+
+    assert called_args["report_path"] == "np6-346-cd/system_wide_actual_load_vs_forecast"
+    assert called_args["kwargs"]["from_param"] == "deliveryDateFrom"
+    assert called_args["kwargs"]["to_param"] == "deliveryDateTo"
+    assert called_args["kwargs"]["param_format"] == "date"
+    assert result["data"][0]["actualLoad"] == 60000
+
+
+def test_get_dam_60day_settlement_point_price(client, monkeypatch):
+    """Test get_dam_60day_settlement_point_price calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload(
+            [{"deliveryDate": "2025-08-01", "settlementPoint": "HB_HOUSTON", "price": 35.75}]
+        )
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    result = client.get_dam_60day_settlement_point_price(
+        date(2025, 8, 1), date(2025, 8, 31), settlement_point="HB_HOUSTON"
+    )
+
+    assert called_args["report_path"] == "np4-188-cd/dam_60d_spp"
+    assert called_args["kwargs"]["from_param"] == "deliveryDateFrom"
+    assert called_args["kwargs"]["to_param"] == "deliveryDateTo"
+    assert called_args["kwargs"]["param_format"] == "date"
+    assert called_args["kwargs"]["params"]["settlementPoint"] == "HB_HOUSTON"
+    assert result["data"][0]["price"] == 35.75
+
+
+# =========================
+# Transmission tests
+# =========================
+
+
+def test_get_dc_tie_flows(client, monkeypatch):
+    """Test get_dc_tie_flows calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload(
+            [
+                {"dcTieName": "DC_N", "powerFlow": -150.5},
+                {"dcTieName": "DC_E", "powerFlow": 0.0},
+            ]
+        )
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    start_dt = datetime(2025, 8, 1, 0, 0, 0)
+    end_dt = datetime(2025, 8, 1, 23, 59, 59)
+    result = client.get_dc_tie_flows(start_dt, end_dt)
+
+    assert called_args["report_path"] == "np6-626-cd/se_load_dctie_flows"
+    assert called_args["kwargs"]["from_param"] == "postDatetimeFrom"
+    assert called_args["kwargs"]["to_param"] == "postDatetimeTo"
+    assert called_args["kwargs"]["param_format"] == "timestamp"
+    assert len(result["data"]) == 2
+    assert result["data"][0]["powerFlow"] == -150.5  # negative = import
+
+
+def test_get_sced_binding_transmission_constraints(client, monkeypatch):
+    """Test get_sced_binding_transmission_constraints calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload(
+            [
+                {
+                    "contingencyName": "LINE_OUTAGE",
+                    "overloadedElementName": "TX_LINE_123",
+                    "shadowPrice": 15.50,
+                    "elementFlow": 1050,
+                    "elementLimit": 1000,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    start_dt = datetime(2025, 8, 1, 0, 0, 0)
+    end_dt = datetime(2025, 8, 1, 23, 59, 59)
+    result = client.get_sced_binding_transmission_constraints(start_dt, end_dt)
+
+    assert called_args["report_path"] == "np6-86-cd/sced_shadow_prices_binding_tx_constraints"
+    assert called_args["kwargs"]["from_param"] == "SCEDTimestampFrom"
+    assert called_args["kwargs"]["to_param"] == "SCEDTimestampTo"
+    assert called_args["kwargs"]["param_format"] == "timestamp"
+    assert result["data"][0]["shadowPrice"] == 15.50
+    assert (
+        result["data"][0]["elementFlow"] > result["data"][0]["elementLimit"]
+    )  # constraint violated
 
 
 if __name__ == "__main__":

@@ -1415,8 +1415,9 @@ class ERCOTClient:
         """Monthly ERCOT Demand Response from ERS (NP3-107).
 
         **Note**: NP3-107 is not currently available through the ERCOT Public API's
-        archive endpoint (unlike NP3-108). This method attempts to retrieve the data
-        from the ERCOT MIS portal using the legacy document download service.
+        archive endpoint (unlike NP3-108). NP3-107 files are published quarterly,
+        not monthly. This method retrieves the quarterly file and filters to the
+        requested month.
 
         The report contains MWs of Demand Response participating in Emergency Response
         Service (ERS) by Load Zone, as published under P.U.C. Subst. R. 25.361.
@@ -1426,8 +1427,7 @@ class ERCOTClient:
         month : DateLike
             Any date within the month to retrieve (e.g., "2025-01-15" for January 2025)
         report_type_id : int, optional
-            The ERCOT MIS reportTypeId for NP3-107. If not provided, the method will
-            attempt to discover it or return None if unavailable.
+            The ERCOT MIS reportTypeId for NP3-107. Default is 13241.
 
         Returns
         -------
@@ -1442,6 +1442,11 @@ class ERCOTClient:
         {'_meta': {...}, 'data': [...]}
         """
         year, mon = self._as_year_month(month)
+
+        # NP3-107 files are published quarterly with specific naming patterns
+        # Use the MIS portal report type ID 13241
+        if report_type_id is None:
+            report_type_id = 13241
 
         # Attempt 1: Try the public API archive endpoint (in case it becomes available)
         entries = self.get_archive_entries("np3-107")
@@ -1470,6 +1475,14 @@ class ERCOTClient:
                 rows = self._parse_ers_demand_response_xlsx(content)
                 if rows:
                     return self._format_ers_demand_response_payload(rows)
+
+        # Attempt 3: Try scraping the data product page
+        logger.info("Attempting to download NP3-107 from ERCOT data product page...")
+        content = self._download_from_data_product_page("np3-107", year, mon)
+        if content:
+            rows = self._parse_ers_demand_response_xlsx(content)
+            if rows:
+                return self._format_ers_demand_response_payload(rows)
 
         logger.error(
             f"NP3-107 (Monthly ERCOT Demand Response from ERS) is not available "
@@ -1516,34 +1529,149 @@ class ERCOTClient:
                 return None
 
             # Search for matching document
+            # For monthly reports: look for _YY_MM pattern
             year_short = year % 100
             month_patterns = [f"_{year_short:02d}_{month:02d}", f"{year_short:02d}_{month:02d}"]
+
+            # For quarterly reports (like NP3-107): look for year and month name
+            month_names = {
+                1: ["Jan", "JanFeb", "JanMar", "DecMar"],
+                2: ["Feb", "JanFeb", "FebMar", "DecMar"],
+                3: ["Mar", "JanMar", "FebMar", "DecMar"],
+                4: ["Apr", "AprMay", "AprJun"],
+                5: ["May", "AprMay", "MayJun"],
+                6: ["Jun", "MayJun", "JunJul", "JunSep"],
+                7: ["Jul", "JunJul", "JulAug", "JunSep"],
+                8: ["Aug", "JulAug", "AugSep", "JunSep"],
+                9: ["Sep", "AugSep", "SepOct", "JunSep"],
+                10: ["Oct", "SepOct", "OctNov", "OctDec"],
+                11: ["Nov", "OctNov", "NovDec", "OctDec"],
+                12: ["Dec", "NovDec", "DecJan", "DecMar"],
+            }
+            quarter_patterns = month_names.get(month, [])
 
             for doc_wrapper in doc_list:
                 doc = doc_wrapper.get("Document", {})
                 friendly_name = doc.get("FriendlyName", "")
 
-                # Check if name matches our date pattern and keywords
-                if any(pattern in friendly_name for pattern in month_patterns):
-                    if all(kw.lower() in friendly_name.lower() for kw in pattern_keywords):
-                        doc_id = doc.get("DocID")
-                        if not doc_id:
-                            continue
+                # Check monthly pattern first
+                has_monthly_pattern = any(pattern in friendly_name for pattern in month_patterns)
 
-                        logger.info(f"Found NP3-107 file in MIS portal: {friendly_name}")
+                # Check quarterly pattern (year + month name substring)
+                has_quarterly_pattern = str(year) in friendly_name and any(
+                    qp in friendly_name for qp in quarter_patterns
+                )
 
-                        # Download the document
-                        download_url = "https://www.ercot.com/misdownload/servlets/mirDownload"
-                        dl_resp = self.session.get(
-                            download_url,
-                            params={"dDocName": doc_id},
-                            timeout=self.config.timeout,
+                # Check if keywords match
+                has_keywords = all(kw.lower() in friendly_name.lower() for kw in pattern_keywords)
+
+                if (has_monthly_pattern or has_quarterly_pattern) and has_keywords:
+                    doc_id = doc.get("DocID")
+                    if not doc_id:
+                        continue
+
+                    logger.info(f"Found file in MIS portal: {friendly_name}")
+
+                    # Download the document
+                    download_url = "https://www.ercot.com/misdownload/servlets/mirDownload"
+                    dl_resp = self.session.get(
+                        download_url,
+                        params={"doclookupId": doc_id},
+                        timeout=self.config.timeout,
+                    )
+                    if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
+                        return dl_resp.content
+                    else:
+                        logger.debug(
+                            f"Download attempt failed or returned small/empty content ({len(dl_resp.content)} bytes)"
                         )
-                        if dl_resp.status_code == 200:
-                            return dl_resp.content
 
         except Exception as e:
             logger.debug(f"MIS portal download failed: {e}")
+
+        return None
+
+    def _download_from_data_product_page(
+        self, product_id: str, year: int, month: int
+    ) -> Optional[bytes]:
+        """Download a file from the ERCOT data product page by scraping the archives.
+
+        This method scrapes the ERCOT data product details page to find download links
+        for specific monthly reports.
+
+        Parameters
+        ----------
+        product_id : str
+            The ERCOT data product ID (e.g., "np3-107")
+        year : int
+            Four-digit year
+        month : int
+            Month (1-12)
+
+        Returns
+        -------
+        Optional[bytes]
+            File content if found and downloaded, None otherwise
+        """
+        url = f"https://www.ercot.com/mp/data-products/data-product-details?id={product_id}"
+
+        try:
+            # Fetch the data product page
+            resp = self.session.get(url, timeout=self.config.timeout)
+            if resp.status_code != 200:
+                logger.debug(f"Data product page returned {resp.status_code} for {product_id}")
+                return None
+
+            html = resp.text
+
+            # Look for download links in the HTML
+            # Pattern: href="...download...Monthly_ERCOT_ERS_DR_YY_MM..."
+            import re
+
+            year_short = year % 100
+            # Flexible patterns to match various naming conventions
+            patterns = [
+                # Monthly_ERCOT_ERS_DR_25_01
+                rf'href="([^"]*(?:download|Download)[^"]*Monthly[^"]*ERS[^"]*DR[^"]*{year_short:02d}_{month:02d}[^"]*)"',
+                # Monthly_ERCOT_Demand_Response_ERS_25_01
+                rf'href="([^"]*(?:download|Download)[^"]*Monthly[^"]*Demand[^"]*Response[^"]*ERS[^"]*{year_short:02d}_{month:02d}[^"]*)"',
+                # NP3-107_25_01 or similar
+                rf'href="([^"]*(?:download|Download)[^"]*NP3-107[^"]*{year_short:02d}_{month:02d}[^"]*)"',
+                # More flexible: any download link with the year_month pattern and keywords
+                rf'href="([^"]*(?:download|Download)[^"]*(?:ERS|107)[^"]*{year_short:02d}_{month:02d}[^"]*)"',
+            ]
+
+            download_url = None
+            for pattern in patterns:
+                matches = re.findall(pattern, html, re.IGNORECASE)
+                if matches:
+                    download_url = matches[0]
+                    break
+
+            if not download_url:
+                logger.debug(
+                    f"No download link found on data product page for {year:04d}-{month:02d}"
+                )
+                return None
+
+            # Make sure URL is absolute
+            if download_url.startswith("/"):
+                download_url = f"https://www.ercot.com{download_url}"
+            elif not download_url.startswith("http"):
+                download_url = f"https://www.ercot.com/{download_url}"
+
+            logger.info(f"Found NP3-107 download link: {download_url}")
+
+            # Download the file
+            dl_resp = self.session.get(download_url, timeout=60)
+            if dl_resp.status_code == 200:
+                logger.info(f"Successfully downloaded NP3-107 from data product page")
+                return dl_resp.content
+            else:
+                logger.debug(f"Download failed with status {dl_resp.status_code}")
+
+        except Exception as e:
+            logger.debug(f"Data product page scraping failed: {e}")
 
         return None
 
@@ -1572,7 +1700,9 @@ class ERCOTClient:
             return []
 
         try:
-            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
+            sheets = pd.read_excel(
+                io.BytesIO(content), sheet_name=None, header=None, engine="openpyxl"
+            )
         except Exception as e:
             logger.error(f"Failed to read NP3-107 xlsx: {e}")
             return []
@@ -1676,7 +1806,14 @@ class ERCOTClient:
         }
 
     def _parse_demand_response_xlsx(self, content: bytes) -> List[Json]:
-        """Parse the NP3-108 xlsx (CLR/NCLR "Report Data" sheets) into dict rows."""
+        """Parse the NP3-108 xlsx (CLR/NCLR "Report Data" sheets) into dict rows.
+
+        Handles two formats:
+        - Old format (pre-2025): Separate "CLR Report Data" and "NCLR Report Data" sheets,
+          headers at row 7, data starts at row 8
+        - New format (2025+): Single "Report Data" sheet with all data,
+          headers at row 2, data starts at row 3
+        """
         try:
             import io
             import pandas as pd
@@ -1693,27 +1830,63 @@ class ERCOTClient:
             sheet = str(sheet_name)
             if "Report Data" not in sheet:
                 continue
-            resource_type = "CLR" if sheet.startswith("CLR") else "NCLR"
-            if df.shape[0] <= 8:
-                continue
-            header = [str(col).strip() for col in df.iloc[7].tolist()]
-            body = df.iloc[8:].copy()
-            body.columns = header
-            for _, rec in body.iterrows():
-                if pd.isna(rec.get("Month")) or pd.isna(rec.get("Hour")):
+
+            # Detect format by checking if row 2 has headers
+            # New format: row 2 has "Month", "Hour", "ASType", etc.
+            # Old format: row 2 has data or blanks, headers at row 7
+            is_new_format = False
+            if df.shape[0] > 2:
+                potential_header = [str(col).strip() for col in df.iloc[2].tolist()]
+                if "Month" in potential_header and "Hour" in potential_header:
+                    is_new_format = True
+
+            if is_new_format:
+                # New format (2025+): headers at row 2, data starts at row 3
+                if df.shape[0] <= 3:
                     continue
-                rows.append(
-                    {
-                        "month": str(rec.get("Month")).strip(),
-                        "hour": int(rec.get("Hour")),
-                        "asType": str(rec.get("ASType") or "").strip(),
-                        "houston": self._clean_mw(rec.get("Houston")),
-                        "north": self._clean_mw(rec.get("North")),
-                        "south": self._clean_mw(rec.get("South")),
-                        "west": self._clean_mw(rec.get("West")),
-                        "resourceType": resource_type,
-                    }
-                )
+                header = [str(col).strip() for col in df.iloc[2].tolist()]
+                body = df.iloc[3:].copy()
+                body.columns = header
+                # New format doesn't have separate CLR/NCLR sheets
+                # For compatibility, we'll mark all as "COMBINED" or could omit resourceType
+                for _, rec in body.iterrows():
+                    if pd.isna(rec.get("Month")) or pd.isna(rec.get("Hour")):
+                        continue
+                    rows.append(
+                        {
+                            "month": str(rec.get("Month")).strip(),
+                            "hour": int(rec.get("Hour")),
+                            "asType": str(rec.get("ASType") or "").strip(),
+                            "houston": self._clean_mw(rec.get("Houston")),
+                            "north": self._clean_mw(rec.get("North")),
+                            "south": self._clean_mw(rec.get("South")),
+                            "west": self._clean_mw(rec.get("West")),
+                            "resourceType": "COMBINED",
+                        }
+                    )
+            else:
+                # Old format (pre-2025): headers at row 7, data starts at row 8
+                resource_type = "CLR" if sheet.startswith("CLR") else "NCLR"
+                if df.shape[0] <= 8:
+                    continue
+                header = [str(col).strip() for col in df.iloc[7].tolist()]
+                body = df.iloc[8:].copy()
+                body.columns = header
+                for _, rec in body.iterrows():
+                    if pd.isna(rec.get("Month")) or pd.isna(rec.get("Hour")):
+                        continue
+                    rows.append(
+                        {
+                            "month": str(rec.get("Month")).strip(),
+                            "hour": int(rec.get("Hour")),
+                            "asType": str(rec.get("ASType") or "").strip(),
+                            "houston": self._clean_mw(rec.get("Houston")),
+                            "north": self._clean_mw(rec.get("North")),
+                            "south": self._clean_mw(rec.get("South")),
+                            "west": self._clean_mw(rec.get("West")),
+                            "resourceType": resource_type,
+                        }
+                    )
         return rows
 
     @staticmethod
@@ -1952,6 +2125,228 @@ class ERCOTClient:
             params=params,
             fetch_all_pages=fetch_all_pages,
             param_format="date",
+        )
+
+    # ---- Generation ----
+
+    def get_wind_power_production(
+        self,
+        delivery_date_from: DateLike,
+        delivery_date_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """Wind Power Production Hourly Averaged Actual (NP4-732-CD): /np4-732-cd/wind_power_production_hourly_averaged_actual
+
+        Hourly-averaged wind generation actuals across ERCOT.
+        """
+        return self.get_report_by_timerange(
+            "np4-732-cd/wind_power_production_hourly_averaged_actual",
+            from_param="deliveryDateFrom",
+            to_param="deliveryDateTo",
+            start=delivery_date_from,
+            end=delivery_date_to or delivery_date_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="date",
+        )
+
+    def get_solar_power_production(
+        self,
+        delivery_date_from: DateLike,
+        delivery_date_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """Solar Power Production Hourly Averaged Actual (NP4-737-CD): /np4-737-cd/solar_power_production_hourly_averaged_actual
+
+        Hourly-averaged solar generation actuals across ERCOT.
+        """
+        return self.get_report_by_timerange(
+            "np4-737-cd/solar_power_production_hourly_averaged_actual",
+            from_param="deliveryDateFrom",
+            to_param="deliveryDateTo",
+            start=delivery_date_from,
+            end=delivery_date_to or delivery_date_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="date",
+        )
+
+    def get_fuel_mix(
+        self,
+        delivery_date_from: DateLike,
+        delivery_date_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """Fuel Mix Report (NP6-785-ER): /np6-785-er/fuel_mix
+
+        Generation by fuel type (Gas, Coal, Nuclear, Wind, Solar, Other) at 5-minute intervals.
+        """
+        return self.get_report_by_timerange(
+            "np6-785-er/fuel_mix",
+            from_param="deliveryDateFrom",
+            to_param="deliveryDateTo",
+            start=delivery_date_from,
+            end=delivery_date_to or delivery_date_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="date",
+        )
+
+    def get_system_wide_actual_load_vs_forecast(
+        self,
+        delivery_date_from: DateLike,
+        delivery_date_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """System Wide Actual Load vs Forecast (NP6-346-CD): /np6-346-cd/system_wide_actual_load_vs_forecast
+
+        ERCOT system-wide load actuals compared against forecasts.
+        """
+        return self.get_report_by_timerange(
+            "np6-346-cd/system_wide_actual_load_vs_forecast",
+            from_param="deliveryDateFrom",
+            to_param="deliveryDateTo",
+            start=delivery_date_from,
+            end=delivery_date_to or delivery_date_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="date",
+        )
+
+    # ---- Interface/Tie Flows ----
+
+    def get_actual_system_lambda(
+        self,
+        sced_timestamp_from: DateLike,
+        sced_timestamp_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """Actual System Lambda (NP6-905-CD): /np6-905-cd/actual_system_lambda
+
+        System lambda (marginal cost of energy) at 5-minute SCED intervals.
+        """
+        return self.get_report_by_timerange(
+            "np6-905-cd/actual_system_lambda",
+            from_param="SCEDTimestampFrom",
+            to_param="SCEDTimestampTo",
+            start=sced_timestamp_from,
+            end=sced_timestamp_to or sced_timestamp_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="timestamp",
+        )
+
+    def get_dam_60day_settlement_point_price(
+        self,
+        delivery_date_from: DateLike,
+        delivery_date_to: Optional[DateLike] = None,
+        *,
+        settlement_point: Optional[str] = None,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """60-Day DAM Settlement Point Prices (NP4-188-CD): /np4-188-cd/dam_60d_spp
+
+        Day-Ahead Market settlement point prices (60-day rolling window).
+        """
+        extra_params = params or {}
+        if settlement_point:
+            extra_params["settlementPoint"] = settlement_point
+
+        return self.get_report_by_timerange(
+            "np4-188-cd/dam_60d_spp",
+            from_param="deliveryDateFrom",
+            to_param="deliveryDateTo",
+            start=delivery_date_from,
+            end=delivery_date_to or delivery_date_from,
+            params=extra_params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="date",
+        )
+
+    def get_unplanned_resource_outages(
+        self,
+        sced_timestamp_from: DateLike,
+        sced_timestamp_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """Unplanned Resource Outages (NP3-233-CD): /np3-233-cd/unplanned_resource_outages
+
+        Real-time unplanned generation resource outages.
+        """
+        return self.get_report_by_timerange(
+            "np3-233-cd/unplanned_resource_outages",
+            from_param="SCEDTimestampFrom",
+            to_param="SCEDTimestampTo",
+            start=sced_timestamp_from,
+            end=sced_timestamp_to or sced_timestamp_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="timestamp",
+        )
+
+    # ---- Transmission & Interconnections ----
+
+    def get_dc_tie_flows(
+        self,
+        post_datetime_from: DateLike,
+        post_datetime_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """State Estimator DC Tie Flows (NP6-626-CD): /np6-626-cd/se_load_dctie_flows
+
+        Actual hourly DC tie flows for ERCOT's four DC interconnections.
+        Negative values = imports into ERCOT, Positive = exports from ERCOT.
+
+        Dashboard: https://www.ercot.com/gridmktinfo/dashboards/dctieflows
+        """
+        return self.get_report_by_timerange(
+            "np6-626-cd/se_load_dctie_flows",
+            from_param="postDatetimeFrom",
+            to_param="postDatetimeTo",
+            start=post_datetime_from,
+            end=post_datetime_to or post_datetime_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="timestamp",
+        )
+
+    def get_sced_binding_transmission_constraints(
+        self,
+        sced_timestamp_from: DateLike,
+        sced_timestamp_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """SCED Shadow Prices and Binding Transmission Constraints (NP6-86-CD): /np6-86-cd/sced_shadow_prices_binding_tx_constraints
+
+        Details on shadow prices for binding or violated transmission constraints in SCED.
+        Useful for identifying when DC ties, interfaces, or transmission lines hit limits.
+        """
+        return self.get_report_by_timerange(
+            "np6-86-cd/sced_shadow_prices_binding_tx_constraints",
+            from_param="SCEDTimestampFrom",
+            to_param="SCEDTimestampTo",
+            start=sced_timestamp_from,
+            end=sced_timestamp_to or sced_timestamp_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="timestamp",
         )
 
 

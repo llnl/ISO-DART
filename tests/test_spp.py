@@ -2153,5 +2153,94 @@ class TestSPPForecastAndORParseErrorDebugBranches:
         )
 
 
+class TestSPPNetworkTimeoutErrors:
+    """Test network timeout and connection error handling (lines 149-151, 310-312)."""
+
+    def test_connect_ftp_timeout_error_with_retry(self, client, caplog):
+        """Test FTP connection timeout triggers retry logic (lines 149-151)."""
+        import ftplib
+
+        call_count = [0]
+
+        class FakeFTP:
+            def __init__(self, *args, **kwargs):
+                call_count[0] += 1
+                if call_count[0] <= 2:
+                    # First two attempts: raise TimeoutError
+                    raise TimeoutError("Connection timed out")
+                # Third attempt: succeed
+
+            def login(self, user, passwd):
+                pass
+
+        caplog.set_level(logging.ERROR)
+        with patch("ftplib.FTP", FakeFTP):
+            result = client._connect_ftp()
+
+        # Should succeed after 2 retries
+        assert result is not None
+        assert call_count[0] == 3
+        # Should log the timeout errors
+        assert any("FTP network/timeout error" in record.message for record in caplog.records)
+
+    def test_connect_ftp_connection_error_exhausts_retries(self, client, caplog):
+        """Test ConnectionError exhausts all retries (lines 149-151)."""
+        import ftplib
+
+        class FakeFTP:
+            def __init__(self, *args, **kwargs):
+                raise ConnectionError("Network is unreachable")
+
+        caplog.set_level(logging.ERROR)
+        with patch("ftplib.FTP", FakeFTP):
+            result = client._connect_ftp()
+
+        # Should fail after all retries
+        assert result is None
+        # Should log multiple retry attempts
+        assert (
+            sum("FTP network/timeout error" in r.message for r in caplog.records)
+            == client.config.max_retries
+        )
+
+    def test_download_ftp_file_timeout_error(self, client, caplog):
+        """Test network timeout during file download (lines 310-312)."""
+        import ftplib
+
+        mock_ftp = Mock(spec=ftplib.FTP)
+        mock_ftp.cwd = Mock()
+        # Simulate timeout when trying to download
+        mock_ftp.retrbinary = Mock(side_effect=TimeoutError("Read timed out"))
+
+        caplog.set_level(logging.INFO)  # Need INFO to capture line 311
+        result = client._download_ftp_file(mock_ftp, "/data/path", "file.csv")
+
+        assert result is None
+        # Should log network/timeout error (line 310)
+        assert any(
+            "Network/timeout error downloading" in record.message for record in caplog.records
+        )
+        # Should log helpful message (line 311)
+        assert any("Consider increasing timeout" in record.message for record in caplog.records)
+
+    def test_download_ftp_file_oserror(self, client, caplog):
+        """Test OSError during file download (lines 310-312)."""
+        import ftplib
+
+        mock_ftp = Mock(spec=ftplib.FTP)
+        mock_ftp.cwd = Mock()
+        # Simulate OSError when trying to download
+        mock_ftp.retrbinary = Mock(side_effect=OSError("Broken pipe"))
+
+        caplog.set_level(logging.ERROR)
+        result = client._download_ftp_file(mock_ftp, "/data/path", "file.csv")
+
+        assert result is None
+        # Should log network/timeout error
+        assert any(
+            "Network/timeout error downloading" in record.message for record in caplog.records
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
