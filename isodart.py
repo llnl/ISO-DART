@@ -888,13 +888,19 @@ def handle_ercot(args):
                 return _save(payload, "dam_hourly_lmp")
 
             elif lmp_type == "sced":
+                # SCED uses timestamp params - convert date to datetime for full day coverage
+                start_dt = datetime.combine(args.start, datetime.min.time())
+                end_dt = datetime.combine(end_date, datetime.max.time())
                 logger.info("Downloading ERCOT SCED LMPs (node/zone/hub)...")
-                payload = client.get_sced_lmps_node_zone_hub(args.start, end_date, params=sp_params)
+                payload = client.get_sced_lmps_node_zone_hub(start_dt, end_dt, params=sp_params)
                 return _save(payload, "sced_lmp_node_zone_hub")
 
             elif lmp_type == "rtd":
+                # RTD uses timestamp params - convert date to datetime for full day coverage
+                start_dt = datetime.combine(args.start, datetime.min.time())
+                end_dt = datetime.combine(end_date, datetime.max.time())
                 logger.info("Downloading ERCOT RTD LMPs (node/zone/hub)...")
-                payload = client.get_rtd_lmps_node_zone_hub(args.start, end_date, params=sp_params)
+                payload = client.get_rtd_lmps_node_zone_hub(start_dt, end_dt, params=sp_params)
                 return _save(payload, "rtd_lmp_node_zone_hub")
 
             elif lmp_type == "electrical_bus":
@@ -1488,9 +1494,13 @@ Examples:
             "rt_fuel_margin",
             "rt_fuel_type",
             "rt_offered_ecomax",
+            "wind",
+            "solar",
+            "fuel_mix",
+            "unplanned_outages",
         ],
         default="rt_fuel_type",
-        help="For MISO Generation: type of generation data to download",
+        help="For MISO & ERCOT Generation: type of generation data to download",
     )
 
     parser.add_argument(
