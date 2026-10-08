@@ -33,6 +33,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 import configparser
+import io
 import json
 import logging
 import math
@@ -110,6 +111,9 @@ class ERCOTConfig:
 
     # Conservative default. Adjust if you know the published limit for your subscription.
     rate_limit_delay: float = 0.35
+
+    # Archive downloads require more aggressive rate limiting to avoid 429 errors
+    archive_rate_limit_delay: float = 1.0
 
     # Pagination
     default_page_size: int = 2000
@@ -2299,6 +2303,219 @@ class ERCOTClient:
 
     # ---- Transmission & Interconnections ----
 
+    def get_dc_tie_flows_from_data_portal(
+        self,
+        start_date: DateLike,
+        end_date: Optional[DateLike] = None,
+    ) -> Optional[Json]:
+        """Download DC tie flows from the ERCOT data portal (data.ercot.com).
+
+        This method downloads historical data from the data.ercot.com portal by
+        querying the archive API with authentication. This is useful for accessing
+        data from 2024 or other periods not available in the regular API archive.
+
+        The files follow the pattern:
+        cdr.00012359.0000000000000000.YYYYMMDD.HHMMSS.SELRTFNP6626.csv
+
+        Parameters
+        ----------
+        start_date : DateLike
+            Start date (YYYY-MM-DD)
+        end_date : DateLike, optional
+            End date (YYYY-MM-DD). If not provided, defaults to start_date.
+
+        Returns
+        -------
+        Optional[Json]
+            Standard Report payload with combined data from all downloaded files.
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            logger.error("pandas is required to read data portal files. `pip install pandas`.")
+            return None
+
+        start = self._as_date(start_date)
+        end = self._as_date(end_date or start_date)
+
+        if start > end:
+            start, end = end, start
+
+        logger.info(
+            f"Downloading DC tie flows from data portal for {start} to {end} "
+            f"({(end - start).days + 1} days)"
+        )
+
+        # Calculate total hours
+        total_hours = ((end - start).days + 1) * 24
+        logger.info(f"This will download {total_hours} hourly files")
+
+        # Ensure we have an auth token
+        token = self._get_token()
+        if not token:
+            logger.error(
+                "Authentication token required for data portal access. "
+                "Please configure username and password in user_config.ini"
+            )
+            return None
+
+        # Generate all hour timestamps for the date range
+        current_dt = datetime(start.year, start.month, start.day, 0, 0, 0)
+        end_dt = datetime(end.year, end.month, end.day, 23, 0, 0)
+
+        all_rows: List[Json] = []
+        failed_downloads = 0
+        successful_downloads = 0
+
+        # Use slower rate limit for data portal downloads
+        original_delay = self.config.rate_limit_delay
+        self.config.rate_limit_delay = self.config.archive_rate_limit_delay
+
+        try:
+            hour_count = 0
+            while current_dt <= end_dt:
+                hour_count += 1
+
+                # Construct filename: cdr.00012359.0000000000000000.YYYYMMDD.HHMMSS.SELRTFNP6626.csv
+                date_str = current_dt.strftime("%Y%m%d")
+                time_str = current_dt.strftime("%H%M%S")
+                filename = f"cdr.00012359.0000000000000000.{date_str}.{time_str}.SELRTFNP6626.csv"
+
+                # Use the archive download endpoint with filename parameter
+                download_url = f"{self.config.base_url}/archive/np6-626-cd/download"
+
+                # Log progress
+                if hour_count == 1 or hour_count % 100 == 0 or hour_count == total_hours:
+                    logger.info(
+                        f"Processing hour {hour_count}/{total_hours}: "
+                        f"{current_dt.strftime('%Y-%m-%d %H:00')}"
+                    )
+
+                # Build authenticated request
+                token = self._get_token()
+                if not token:
+                    logger.error("Token expired, unable to continue")
+                    break
+
+                headers, params = self._build_auth(params={"filename": filename}, id_token=token)
+
+                try:
+                    self._rate_limit()
+                    resp = self.session.request(
+                        method="GET",
+                        url=download_url,
+                        params=params,
+                        headers=headers,
+                        timeout=self.config.timeout,
+                        stream=False,
+                    )
+
+                    if resp.status_code == 200:
+                        # Parse CSV content
+                        try:
+                            df = pd.read_csv(io.StringIO(resp.text))
+
+                            # Normalize column names to match API format
+                            column_map = {
+                                "TAGCLAST_TIME": "TAGCTimestamp",
+                                "TAGCLAST_TIME_DST": "TAGCTimeDST",
+                                "TIE_LINE_ID": "TIELineId",
+                                "MW_TIE": "MWTIE",
+                                "TEID_TIE": "TEIDTIE",
+                            }
+                            df = df.rename(columns=column_map)
+
+                            # Convert timestamp format from "MM/DD/YYYY HH:MM:SS" to ISO
+                            if "TAGCTimestamp" in df.columns:
+                                df["TAGCTimestamp"] = pd.to_datetime(
+                                    df["TAGCTimestamp"], format="%m/%d/%Y %H:%M:%S"
+                                ).dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+                            rows = df.to_dict("records")
+                            all_rows.extend(rows)
+                            successful_downloads += 1
+
+                        except (pd.errors.ParserError, KeyError) as e:
+                            logger.warning(f"Failed to parse {filename}: {e}")
+                            failed_downloads += 1
+
+                    else:
+                        # File not found or error
+                        if resp.status_code != 404:  # 404s are expected for some hours
+                            logger.debug(f"HTTP {resp.status_code} for {filename}")
+                        failed_downloads += 1
+
+                        # If too many consecutive failures, abort
+                        if failed_downloads > 50 and successful_downloads == 0:
+                            logger.error(
+                                "Too many download failures with no successes, aborting. "
+                                "The data portal may not have files for this date range."
+                            )
+                            return None
+
+                except requests.RequestException as e:
+                    logger.warning(f"Request error for {filename}: {e}")
+                    failed_downloads += 1
+
+                # Move to next hour
+                current_dt += timedelta(hours=1)
+
+        finally:
+            # Restore original rate limit
+            self.config.rate_limit_delay = original_delay
+
+        if not all_rows:
+            logger.error(
+                "No data downloaded from data portal. "
+                "Files may not be available for this date range."
+            )
+            return None
+
+        logger.info(
+            f"Successfully downloaded {successful_downloads}/{total_hours} files "
+            f"({failed_downloads} failed)"
+        )
+
+        # Remove duplicates
+        seen = set()
+        unique_rows = []
+        for row in all_rows:
+            key = (row.get("TAGCTimestamp"), row.get("TIELineId"))
+            if key not in seen:
+                seen.add(key)
+                unique_rows.append(row)
+
+        # Sort by timestamp
+        unique_rows.sort(key=lambda r: (r.get("TAGCTimestamp", ""), r.get("TIELineId", "")))
+
+        logger.info(f"Extracted {len(unique_rows)} unique records")
+
+        # Return in standard Report payload format
+        payload: Json = {
+            "_meta": {
+                "totalRecords": len(unique_rows),
+                "totalPages": 1,
+                "currentPage": 1,
+                "pageSize": len(unique_rows),
+            },
+            "report": {
+                "reportName": "se_load_dcties_flows",
+                "reportDisplayName": "State Estimator DC Tie Flows (Data Portal)",
+                "reportId": "12359",
+                "reportEMIL": "NP6-626-CD",
+            },
+            "fields": [
+                {"name": "TAGCTimestamp", "dataType": "DATETIME"},
+                {"name": "TAGCTimeDST", "dataType": "STRING"},
+                {"name": "TIELineId", "dataType": "STRING"},
+                {"name": "MWTIE", "dataType": "DOUBLE"},
+                {"name": "TEIDTIE", "dataType": "DOUBLE"},
+            ],
+            "data": unique_rows,
+            "links": [],
+        }
+        return payload
+
     def get_dc_tie_flows(
         self,
         post_datetime_from: DateLike,
@@ -2307,23 +2524,239 @@ class ERCOTClient:
         params: Optional[Params] = None,
         fetch_all_pages: bool = True,
     ) -> Optional[Json]:
-        """State Estimator DC Tie Flows (NP6-626-CD): /np6-626-cd/se_load_dctie_flows
+        """State Estimator DC Tie Flows (NP6-626-CD): /np6-626-cd/se_load_dcties_flows
 
         Actual hourly DC tie flows for ERCOT's four DC interconnections.
         Negative values = imports into ERCOT, Positive = exports from ERCOT.
 
         Dashboard: https://www.ercot.com/gridmktinfo/dashboards/dctieflows
+
+        Note: The API endpoint only provides the last 7 days of data. For historical
+        data older than 7 days, this method automatically uses the archive endpoint.
         """
-        return self.get_report_by_timerange(
-            "np6-626-cd/se_load_dctie_flows",
-            from_param="postDatetimeFrom",
-            to_param="postDatetimeTo",
+        # Convert to datetime for comparison
+        start_dt = (
+            post_datetime_from
+            if isinstance(post_datetime_from, datetime)
+            else (
+                datetime.fromisoformat(str(post_datetime_from)[:19])
+                if isinstance(post_datetime_from, str)
+                else datetime(
+                    post_datetime_from.year, post_datetime_from.month, post_datetime_from.day
+                )
+            )
+        )
+        end_dt = post_datetime_to or post_datetime_from
+        if not isinstance(end_dt, datetime):
+            end_dt = (
+                datetime.fromisoformat(str(end_dt)[:19])
+                if isinstance(end_dt, str)
+                else datetime(end_dt.year, end_dt.month, end_dt.day, 23, 59, 59)
+            )
+
+        # Check if data is older than 7 days (API display duration)
+        now = datetime.now()
+        days_old = (now - start_dt).days
+
+        if days_old > 7:
+            # For data older than ~45 days, the regular archive may not have it
+            # Try the data portal method instead
+            if days_old > 45:
+                logger.info(
+                    f"Data is older than 45 days, using data portal for {start_dt.date()} to {end_dt.date()}"
+                )
+                return self.get_dc_tie_flows_from_data_portal(start_dt.date(), end_dt.date())
+            else:
+                logger.info(
+                    f"Data is older than 7 days, using archive endpoint for {start_dt.date()} to {end_dt.date()}"
+                )
+                return self._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+        # Try the regular API endpoint first
+        result = self.get_report_by_timerange(
+            "np6-626-cd/se_load_dcties_flows",
+            from_param="TAGCTimestampFrom",
+            to_param="TAGCTimestampTo",
             start=post_datetime_from,
             end=post_datetime_to or post_datetime_from,
             params=params,
             fetch_all_pages=fetch_all_pages,
             param_format="timestamp",
         )
+
+        # If no data returned and it's close to the 7-day boundary, try archive as fallback
+        if result and not result.get("data"):
+            if (now - start_dt).days >= 6:
+                logger.info("No data from API endpoint, trying archive as fallback...")
+                return self._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+        return result
+
+    def _get_dc_tie_flows_from_archive(
+        self, start_dt: datetime, end_dt: datetime
+    ) -> Optional[Json]:
+        """Download DC tie flows from the archive endpoint for historical data.
+
+        Archives are posted hourly as ZIP files containing CSV data. This method
+        downloads all relevant archives for the date range and combines them.
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            logger.error("pandas is required to read archive files. Please `pip install pandas`.")
+            return None
+
+        import io
+
+        # Get all archive entries
+        entries = self.get_archive_entries("np6-626-cd")
+        if not entries:
+            logger.warning("No archive entries found for NP6-626-CD")
+            return None
+
+        # Filter archives that fall within our date range
+        # Archives are posted hourly, so we need all archives where the post time is within range
+        relevant_entries = []
+        for entry in entries:
+            post_dt_str = entry.get("postDatetime", "")
+            if not post_dt_str:
+                continue
+            try:
+                # Parse ISO format: 2026-09-01T23:10:00.000
+                post_dt = datetime.fromisoformat(post_dt_str.replace("Z", "").split(".")[0])
+                # Include archives posted within our range (with 1-hour buffer)
+                if start_dt <= post_dt <= end_dt + timedelta(hours=1):
+                    relevant_entries.append(entry)
+            except (ValueError, AttributeError):
+                continue
+
+        if not relevant_entries:
+            logger.warning(
+                f"No archive entries found for date range {start_dt.date()} to {end_dt.date()}"
+            )
+            return None
+
+        logger.info(
+            f"Found {len(relevant_entries)} archive files for date range {start_dt.date()} to {end_dt.date()}"
+        )
+
+        # Download and parse each archive
+        all_rows: List[Json] = []
+        failed_downloads = 0
+
+        # Add extra delay between archive downloads to avoid rate limiting
+        original_delay = self.config.rate_limit_delay
+        self.config.rate_limit_delay = self.config.archive_rate_limit_delay
+
+        try:
+            for i, entry in enumerate(relevant_entries, 1):
+                doc_id = entry.get("docId")
+                post_time = entry.get("postDatetime", "")
+
+                # Log progress every 10 files or for first/last
+                if i == 1 or i == len(relevant_entries) or i % 10 == 0:
+                    logger.info(f"Processing archive {i}/{len(relevant_entries)}: {post_time}")
+
+                content = self.download_archive("np6-626-cd", doc_id)
+                if not content:
+                    failed_downloads += 1
+                    logger.warning(f"Failed to download archive {doc_id}")
+                    # If too many failures, abort
+                    if failed_downloads > 5:
+                        logger.error("Too many download failures, aborting archive retrieval")
+                        return None
+                    continue
+
+                # Extract and parse CSV from ZIP
+                try:
+                    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                        csv_files = [f for f in zf.namelist() if f.endswith(".csv")]
+                        if not csv_files:
+                            logger.warning(f"No CSV file found in archive {doc_id}")
+                            continue
+
+                        with zf.open(csv_files[0]) as csv_file:
+                            df = pd.read_csv(csv_file)
+
+                            # Normalize column names to match API format
+                            # Archive: TAGCLAST_TIME, TAGCLAST_TIME_DST, TIE_LINE_ID, MW_TIE, TEID_TIE
+                            # API: TAGCTimestamp, TAGCTimeDST, TIELineId, MWTIE, TEIDTIE
+                            column_map = {
+                                "TAGCLAST_TIME": "TAGCTimestamp",
+                                "TAGCLAST_TIME_DST": "TAGCTimeDST",
+                                "TIE_LINE_ID": "TIELineId",
+                                "MW_TIE": "MWTIE",
+                                "TEID_TIE": "TEIDTIE",
+                            }
+                            df = df.rename(columns=column_map)
+
+                            # Convert timestamp format from "09/01/2026 23:09:53" to ISO format
+                            if "TAGCTimestamp" in df.columns:
+                                df["TAGCTimestamp"] = pd.to_datetime(
+                                    df["TAGCTimestamp"], format="%m/%d/%Y %H:%M:%S"
+                                ).dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+                            # Filter to exact date range
+                            df["_ts"] = pd.to_datetime(df["TAGCTimestamp"])
+                            df = df[(df["_ts"] >= start_dt) & (df["_ts"] <= end_dt)]
+                            df = df.drop(columns=["_ts"])
+
+                            # Convert to dict rows
+                            rows = df.to_dict("records")
+                            all_rows.extend(rows)
+
+                except (zipfile.BadZipFile, pd.errors.ParserError, KeyError) as e:
+                    logger.warning(f"Failed to parse archive {doc_id}: {e}")
+                    continue
+
+        finally:
+            # Restore original rate limit delay
+            self.config.rate_limit_delay = original_delay
+
+        if not all_rows:
+            logger.warning("No data extracted from archives")
+            return None
+
+        # Remove duplicates (archives may overlap at hourly boundaries)
+        # Use a set to track unique (timestamp, tie_line) combinations
+        seen = set()
+        unique_rows = []
+        for row in all_rows:
+            key = (row.get("TAGCTimestamp"), row.get("TIELineId"))
+            if key not in seen:
+                seen.add(key)
+                unique_rows.append(row)
+
+        # Sort by timestamp ascending
+        unique_rows.sort(key=lambda r: (r.get("TAGCTimestamp", ""), r.get("TIELineId", "")))
+
+        logger.info(f"Extracted {len(unique_rows)} records from archives")
+
+        # Return in standard Report payload format
+        payload: Json = {
+            "_meta": {
+                "totalRecords": len(unique_rows),
+                "totalPages": 1,
+                "currentPage": 1,
+                "pageSize": len(unique_rows),
+            },
+            "report": {
+                "reportName": "se_load_dcties_flows",
+                "reportDisplayName": "State Estimator DC Tie Flows (Archive)",
+                "reportId": "12359",
+                "reportEMIL": "NP6-626-CD",
+            },
+            "fields": [
+                {"name": "TAGCTimestamp", "dataType": "DATETIME"},
+                {"name": "TAGCTimeDST", "dataType": "STRING"},
+                {"name": "TIELineId", "dataType": "STRING"},
+                {"name": "MWTIE", "dataType": "DOUBLE"},
+                {"name": "TEIDTIE", "dataType": "DOUBLE"},
+            ],
+            "data": unique_rows,
+            "links": [],
+        }
+        return payload
 
     def get_sced_binding_transmission_constraints(
         self,

@@ -1673,6 +1673,26 @@ Examples:
     )
 
     parser.add_argument(
+        "--trans-type",
+        choices=["dc_ties", "binding_constraints"],
+        default="dc_ties",
+        help=(
+            "For ERCOT transmission: type of transmission data to download. "
+            "dc_ties=DC Tie Flows (NP6-626-CD), binding_constraints=SCED Binding Transmission Constraints (NP6-86-CD)"
+        ),
+    )
+
+    parser.add_argument(
+        "--ops-type",
+        choices=["lambda", "load_vs_forecast", "dam_60d_prices"],
+        default="lambda",
+        help=(
+            "For ERCOT system-operations: type of system operations data to download. "
+            "lambda=Actual System Lambda, load_vs_forecast=Load vs Forecast, dam_60d_prices=60-day DAM Settlement Point Prices"
+        ),
+    )
+
+    parser.add_argument(
         "--interactive",
         action="store_true",
         default=False,

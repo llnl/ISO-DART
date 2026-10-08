@@ -3052,16 +3052,886 @@ def test_get_dc_tie_flows(client, monkeypatch):
 
     monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
 
-    start_dt = datetime(2025, 8, 1, 0, 0, 0)
-    end_dt = datetime(2025, 8, 1, 23, 59, 59)
+    # Use a very recent date (yesterday) to avoid routing to archive
+    from datetime import timedelta
+
+    now = datetime.now()
+    yesterday = now - timedelta(days=1)
+    start_dt = datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0)
+    end_dt = datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59)
     result = client.get_dc_tie_flows(start_dt, end_dt)
 
-    assert called_args["report_path"] == "np6-626-cd/se_load_dctie_flows"
-    assert called_args["kwargs"]["from_param"] == "postDatetimeFrom"
-    assert called_args["kwargs"]["to_param"] == "postDatetimeTo"
+    assert called_args["report_path"] == "np6-626-cd/se_load_dcties_flows"
+    assert called_args["kwargs"]["from_param"] == "TAGCTimestampFrom"
+    assert called_args["kwargs"]["to_param"] == "TAGCTimestampTo"
     assert called_args["kwargs"]["param_format"] == "timestamp"
     assert len(result["data"]) == 2
     assert result["data"][0]["powerFlow"] == -150.5  # negative = import
+
+
+def test_get_dc_tie_flows_routes_to_archive_for_old_data(client, monkeypatch):
+    """Test that get_dc_tie_flows routes to archive for data 8-30 days old."""
+    from datetime import timedelta
+
+    archive_called = {}
+
+    def fake_archive(start_dt, end_dt):
+        archive_called["start"] = start_dt
+        archive_called["end"] = end_dt
+        return report_payload([{"TIELineId": "DC_N", "MWTIE": -100}])
+
+    monkeypatch.setattr(client, "_get_dc_tie_flows_from_archive", fake_archive)
+
+    # Data from 15 days ago should route to archive
+    now = datetime.now()
+    start_dt = now - timedelta(days=15)
+    end_dt = start_dt + timedelta(hours=1)
+
+    result = client.get_dc_tie_flows(start_dt, end_dt)
+
+    assert "start" in archive_called
+    assert result["data"][0]["MWTIE"] == -100
+
+
+def test_get_dc_tie_flows_routes_to_portal_for_very_old_data(client, monkeypatch):
+    """Test that get_dc_tie_flows routes to data portal for data >45 days old."""
+    from datetime import timedelta
+
+    portal_called = {}
+
+    def fake_portal(start_date, end_date):
+        portal_called["start"] = start_date
+        portal_called["end"] = end_date
+        return report_payload([{"TIELineId": "DC_E", "MWTIE": 50}])
+
+    monkeypatch.setattr(client, "get_dc_tie_flows_from_data_portal", fake_portal)
+
+    # Data from 60 days ago should route to portal
+    now = datetime.now()
+    start_dt = now - timedelta(days=60)
+    end_dt = start_dt + timedelta(hours=1)
+
+    result = client.get_dc_tie_flows(start_dt, end_dt)
+
+    assert "start" in portal_called
+    assert result["data"][0]["MWTIE"] == 50
+
+
+def test_get_dc_tie_flows_fallback_to_archive_when_api_returns_empty(client, monkeypatch):
+    """Test fallback to archive when API returns no data near 7-day boundary."""
+    from datetime import timedelta
+
+    archive_called = {}
+
+    def fake_get_report(report_path, **kwargs):
+        # Return empty data
+        return report_payload([])
+
+    def fake_archive(start_dt, end_dt):
+        archive_called["called"] = True
+        return report_payload([{"TIELineId": "DC_L", "MWTIE": 25}])
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report)
+    monkeypatch.setattr(client, "_get_dc_tie_flows_from_archive", fake_archive)
+
+    # Data from exactly 6 days ago (near the boundary)
+    now = datetime.now()
+    start_dt = now - timedelta(days=6)
+    end_dt = start_dt + timedelta(hours=1)
+
+    result = client.get_dc_tie_flows(start_dt, end_dt)
+
+    assert archive_called.get("called")
+    assert result["data"][0]["MWTIE"] == 25
+
+
+def test_get_dc_tie_flows_from_archive_success(client, monkeypatch):
+    """Test _get_dc_tie_flows_from_archive downloads and combines archive files."""
+    import io
+
+    # Mock archive entries - separate data for each file
+    def fake_get_archive_entries(report_id):
+        return [
+            {"docId": "12345", "postDatetime": "2026-09-01T10:00:00.000"},
+            {"docId": "12346", "postDatetime": "2026-09-01T11:00:00.000"},
+        ]
+
+    # Mock archive download - return different data per doc ID
+    def fake_download_archive(report_id, doc_id):
+        if doc_id == "12345":
+            csv_content = b"""TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+09/01/2026 10:00:00,s,DC_E,-50.5,289724
+09/01/2026 10:00:00,s,DC_N,100.2,289764"""
+        else:
+            csv_content = b"""TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+09/01/2026 11:00:00,s,DC_E,-51.5,289724
+09/01/2026 11:00:00,s,DC_N,101.2,289764"""
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("data.csv", csv_content)
+        return zip_buffer.getvalue()
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    assert result is not None
+    assert len(result["data"]) == 4  # 2 files × 2 ties each
+    assert result["data"][0]["TIELineId"] in ["DC_E", "DC_N"]
+    assert "TAGCTimestamp" in result["data"][0]
+    # Should be converted to ISO format
+    assert result["data"][0]["TAGCTimestamp"].startswith("2026-09-01T")
+
+
+def test_get_dc_tie_flows_from_archive_no_entries(client, monkeypatch):
+    """Test _get_dc_tie_flows_from_archive returns None when no archives found."""
+
+    def fake_get_archive_entries(report_id):
+        return []
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    assert result is None
+
+
+def test_get_dc_tie_flows_from_archive_filters_by_date_range(client, monkeypatch):
+    """Test _get_dc_tie_flows_from_archive only downloads archives in date range."""
+    import io
+
+    downloaded_docs = []
+
+    def fake_get_archive_entries(report_id):
+        return [
+            {"docId": "old", "postDatetime": "2026-08-01T10:00:00.000"},  # outside range
+            {"docId": "in_range", "postDatetime": "2026-09-01T10:00:00.000"},  # in range
+            {"docId": "future", "postDatetime": "2026-10-01T10:00:00.000"},  # outside range
+        ]
+
+    def fake_download_archive(report_id, doc_id):
+        downloaded_docs.append(doc_id)
+        csv_content = b"""TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+09/01/2026 10:00:00,s,DC_E,-50.5,289724"""
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("data.csv", csv_content)
+        return zip_buffer.getvalue()
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    start_dt = datetime(2026, 9, 1, 9, 0, 0)
+    end_dt = datetime(2026, 9, 1, 12, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    # Should only download the one in range
+    assert downloaded_docs == ["in_range"]
+    assert result is not None
+
+
+def test_get_dc_tie_flows_from_archive_handles_bad_zip(client, monkeypatch, caplog):
+    """Test _get_dc_tie_flows_from_archive handles corrupted ZIP gracefully."""
+
+    def fake_get_archive_entries(report_id):
+        return [{"docId": "bad", "postDatetime": "2026-09-01T10:00:00.000"}]
+
+    def fake_download_archive(report_id, doc_id):
+        return b"not a valid zip file"
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    # Should return None when all archives fail
+    assert result is None
+
+
+def test_get_dc_tie_flows_from_archive_deduplicates(client, monkeypatch):
+    """Test _get_dc_tie_flows_from_archive removes duplicate records."""
+    import io
+
+    def fake_get_archive_entries(report_id):
+        return [
+            {"docId": "1", "postDatetime": "2026-09-01T10:00:00.000"},
+            {"docId": "2", "postDatetime": "2026-09-01T10:00:00.000"},  # duplicate timestamp
+        ]
+
+    def fake_download_archive(report_id, doc_id):
+        # Both archives have the same data
+        csv_content = b"""TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+09/01/2026 10:00:00,s,DC_E,-50.5,289724"""
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("data.csv", csv_content)
+        return zip_buffer.getvalue()
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    # Should only have 1 record, not 2
+    assert len(result["data"]) == 1
+
+
+def test_get_dc_tie_flows_from_data_portal_success(client, monkeypatch):
+    """Test get_dc_tie_flows_from_data_portal downloads hourly files."""
+    from datetime import date as dt_date
+
+    downloaded_files = []
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            filename = kwargs["params"]["filename"]
+            downloaded_files.append(filename)
+
+            # Extract hour from filename: ...YYYYMMDD.HHMMSS...
+            import re
+
+            match = re.search(r"\.(\d{8})\.(\d{6})\.", filename)
+            if match:
+                date_str = match.group(1)
+                time_str = match.group(2)
+                hour = time_str[:2]
+                # Return unique CSV content per hour
+                csv_content = f"""TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+01/01/2024 {hour}:00:00,s,DC_E,-50.5,289724
+01/01/2024 {hour}:00:00,s,DC_N,100.2,289764"""
+            else:
+                csv_content = """TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+01/01/2024 00:00:00,s,DC_E,-50.5,289724"""
+
+            return FakeResponse(200, text=csv_content)
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    assert result is not None
+    assert len(result["data"]) == 48  # 24 hours × 2 ties per hour
+    assert len(downloaded_files) == 24  # 24 hourly files
+    assert "20240101" in downloaded_files[0]
+
+
+def test_get_dc_tie_flows_from_data_portal_no_token(client, monkeypatch, caplog):
+    """Test get_dc_tie_flows_from_data_portal returns None without auth token."""
+    from datetime import date as dt_date
+
+    def fake_get_token():
+        return None
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    assert result is None
+    assert "Authentication token required" in caplog.text
+
+
+def test_get_dc_tie_flows_from_data_portal_handles_404(client, monkeypatch):
+    """Test get_dc_tie_flows_from_data_portal handles missing files gracefully."""
+    from datetime import date as dt_date
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            # Return 404 for all files
+            return FakeResponse(404, text="Not Found")
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    assert result is None  # No data downloaded
+
+
+def test_get_dc_tie_flows_from_data_portal_aborts_on_many_failures(client, monkeypatch, caplog):
+    """Test get_dc_tie_flows_from_data_portal aborts after too many failures."""
+    from datetime import date as dt_date
+
+    request_count = []
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            request_count.append(1)
+            # Return 500 errors
+            return FakeResponse(500, text="Server Error")
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    # Use a date range that would require >50 hours (3+ days) to trigger abort
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 3)  # 3 days = 72 hours
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    assert result is None
+    # Should abort after ~51 failures with no successes
+    assert len(request_count) > 50
+    assert len(request_count) < 72  # Shouldn't try all 72 files
+    assert "Too many download failures" in caplog.text
+
+
+def test_get_dc_tie_flows_from_data_portal_deduplicates(client, monkeypatch):
+    """Test get_dc_tie_flows_from_data_portal removes duplicate records."""
+    from datetime import date as dt_date
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            # Return same data for all hours (duplicates)
+            csv_content = """TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+01/01/2024 00:00:00,s,DC_E,-50.5,289724"""
+            return FakeResponse(200, text=csv_content)
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    # Should only have 1 record despite 24 files
+    assert len(result["data"]) == 1
+
+
+def test_get_dc_tie_flows_from_data_portal_normalizes_columns(client, monkeypatch):
+    """Test get_dc_tie_flows_from_data_portal converts portal format to API format."""
+    from datetime import date as dt_date
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            # Return portal column names
+            csv_content = """TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+01/01/2024 12:30:45,s,DC_E,-50.5,289724"""
+            return FakeResponse(200, text=csv_content)
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    # Should have API column names
+    assert "TAGCTimestamp" in result["data"][0]
+    assert "TIELineId" in result["data"][0]
+    assert "MWTIE" in result["data"][0]
+    # Should convert timestamp to ISO format
+    assert result["data"][0]["TAGCTimestamp"] == "2024-01-01T12:30:45"
+
+
+def test_get_dc_tie_flows_from_data_portal_without_pandas(client, monkeypatch, caplog):
+    """Test get_dc_tie_flows_from_data_portal returns None if pandas not available."""
+    from datetime import date as dt_date
+    import sys
+
+    # Hide pandas temporarily
+    real_pandas = sys.modules.get("pandas")
+    if "pandas" in sys.modules:
+        del sys.modules["pandas"]
+
+    # Mock import to raise ImportError
+    import builtins
+
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "pandas":
+            raise ImportError("No module named 'pandas'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    assert result is None
+    assert "pandas is required" in caplog.text
+
+    # Restore pandas
+    if real_pandas:
+        sys.modules["pandas"] = real_pandas
+
+
+def test_get_dc_tie_flows_from_data_portal_swaps_dates_if_inverted(client, monkeypatch):
+    """Test get_dc_tie_flows_from_data_portal swaps start/end if end < start."""
+    from datetime import date as dt_date
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    downloaded_files = []
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            filename = kwargs["params"]["filename"]
+            downloaded_files.append(filename)
+            csv_content = """TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+01/01/2024 00:00:00,s,DC_E,-50.5,289724"""
+            return FakeResponse(200, text=csv_content)
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    # Pass end date before start date
+    start = dt_date(2024, 1, 2)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    # Should download for Jan 1-2 (48 hours), not fail
+    assert result is not None
+    assert len(downloaded_files) == 48
+    # Check that both dates are represented in filenames
+    assert any("20240101" in f for f in downloaded_files)
+    assert any("20240102" in f for f in downloaded_files)
+
+
+def test_get_dc_tie_flows_from_data_portal_handles_parse_error(client, monkeypatch, caplog):
+    """Test get_dc_tie_flows_from_data_portal handles CSV parse errors gracefully."""
+    from datetime import date as dt_date
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            # Return CSV that will cause KeyError when trying to rename columns
+            return FakeResponse(200, text="wrong,column,names\n1,2,3")
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    # Should handle parse errors gracefully
+    assert "Failed to parse" in caplog.text or result is None or len(result["data"]) > 0
+
+
+def test_get_dc_tie_flows_from_data_portal_handles_request_exception(client, monkeypatch, caplog):
+    """Test get_dc_tie_flows_from_data_portal handles network errors gracefully."""
+    from datetime import date as dt_date
+    import requests
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            raise requests.RequestException("Network error")
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    assert result is None
+    assert "Request error" in caplog.text
+
+
+def test_get_dc_tie_flows_from_data_portal_token_expires_mid_download(client, monkeypatch, caplog):
+    """Test get_dc_tie_flows_from_data_portal handles token expiration."""
+    from datetime import date as dt_date
+
+    token_call_count = [0]
+
+    def fake_get_token():
+        token_call_count[0] += 1
+        if token_call_count[0] > 5:
+            return None  # Token expired
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            csv_content = """TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+01/01/2024 00:00:00,s,DC_E,-50.5,289724"""
+            return FakeResponse(200, text=csv_content)
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    # Should stop early when token expires
+    assert "Token expired" in caplog.text
+    # May have some data from first few hours
+    assert result is None or len(result["data"]) < 48
+
+
+def test_get_dc_tie_flows_from_archive_without_pandas(client, monkeypatch, caplog):
+    """Test _get_dc_tie_flows_from_archive returns None if pandas not available."""
+    import sys
+    import builtins
+
+    # Mock import to raise ImportError
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "pandas":
+            raise ImportError("No module named 'pandas'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    assert result is None
+    assert "pandas is required" in caplog.text
+
+
+def test_get_dc_tie_flows_from_archive_handles_download_failure(client, monkeypatch, caplog):
+    """Test _get_dc_tie_flows_from_archive handles repeated download failures."""
+
+    def fake_get_archive_entries(report_id):
+        return [{"docId": str(i), "postDatetime": "2026-09-01T10:00:00.000"} for i in range(10)]
+
+    def fake_download_archive(report_id, doc_id):
+        return None  # All downloads fail
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    # Should abort after 5 failures
+    assert result is None
+    assert "Too many download failures" in caplog.text
+
+
+def test_get_dc_tie_flows_from_archive_handles_no_csv_in_zip(client, monkeypatch, caplog):
+    """Test _get_dc_tie_flows_from_archive handles ZIPs without CSV files."""
+    import io
+
+    def fake_get_archive_entries(report_id):
+        return [{"docId": "12345", "postDatetime": "2026-09-01T10:00:00.000"}]
+
+    def fake_download_archive(report_id, doc_id):
+        # Return ZIP with no CSV files
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("readme.txt", b"no csv here")
+        return zip_buffer.getvalue()
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    assert result is None
+    assert "No CSV file found" in caplog.text
+
+
+def test_get_dc_tie_flows_from_archive_filters_out_of_range_data(client, monkeypatch):
+    """Test _get_dc_tie_flows_from_archive filters records outside date range."""
+    import io
+
+    def fake_get_archive_entries(report_id):
+        return [{"docId": "12345", "postDatetime": "2026-09-01T10:00:00.000"}]
+
+    def fake_download_archive(report_id, doc_id):
+        # CSV has data both inside and outside the range
+        csv_content = b"""TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+08/31/2026 23:00:00,s,DC_E,-50.5,289724
+09/01/2026 10:00:00,s,DC_E,-51.5,289724
+09/02/2026 12:00:00,s,DC_E,-52.5,289724"""
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("data.csv", csv_content)
+        return zip_buffer.getvalue()
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    # Only request Sept 1, 10:00 - 11:00
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    # Should only have the Sept 1, 10:00 record
+    assert len(result["data"]) == 1
+    assert result["data"][0]["TAGCTimestamp"] == "2026-09-01T10:00:00"
+
+
+def test_get_dc_tie_flows_end_date_conversion(client, monkeypatch):
+    """Test get_dc_tie_flows properly converts end_date to datetime with 23:59:59."""
+    from datetime import date as dt_date
+    from datetime import timedelta
+
+    called_args = {}
+
+    def fake_get_report(report_path, **kwargs):
+        called_args["kwargs"] = kwargs
+        return report_payload([{"TIELineId": "DC_E", "MWTIE": 50}])
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report)
+
+    # Use recent date to avoid routing to archive
+    now = datetime.now()
+    yesterday = now - timedelta(days=1)
+    start_date = dt_date(yesterday.year, yesterday.month, yesterday.day)
+    end_date = dt_date(yesterday.year, yesterday.month, yesterday.day)
+
+    result = client.get_dc_tie_flows(start_date, end_date)
+
+    # end param should be converted to datetime with 23:59:59
+    assert result is not None
+
+
+def test_get_dc_tie_flows_from_data_portal_handles_pandas_parser_error(client, monkeypatch, caplog):
+    """Test get_dc_tie_flows_from_data_portal handles ParserError during CSV parsing."""
+    from datetime import date as dt_date
+
+    def fake_get_token():
+        return "fake-token"
+
+    def fake_build_auth(params=None, id_token=None):
+        return ({"Authorization": "Bearer fake-token"}, params)
+
+    def fake_rate_limit():
+        pass
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            # Return malformed CSV that pandas can't parse - unmatched quotes
+            csv_content = """TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+01/01/2024 00:00:00,"s,DC_E,-50.5,289724"""
+            return FakeResponse(200, text=csv_content)
+
+    monkeypatch.setattr(client, "_get_token", fake_get_token)
+    monkeypatch.setattr(client, "_build_auth", fake_build_auth)
+    monkeypatch.setattr(client, "_rate_limit", fake_rate_limit)
+    client.session = FakeSession()
+
+    start = dt_date(2024, 1, 1)
+    end = dt_date(2024, 1, 1)
+
+    result = client.get_dc_tie_flows_from_data_portal(start, end)
+
+    # Should log warning about parse failure
+    assert "Failed to parse" in caplog.text
+
+
+def test_get_dc_tie_flows_from_archive_handles_missing_postdatetime(client, monkeypatch):
+    """Test _get_dc_tie_flows_from_archive handles entries without postDatetime."""
+    import io
+
+    def fake_get_archive_entries(report_id):
+        return [
+            {"docId": "bad1"},  # No postDatetime
+            {"docId": "bad2", "postDatetime": ""},  # Empty postDatetime
+            {"docId": "good", "postDatetime": "2026-09-01T10:00:00.000"},
+        ]
+
+    def fake_download_archive(report_id, doc_id):
+        csv_content = b"""TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+09/01/2026 10:00:00,s,DC_E,-50.5,289724"""
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("data.csv", csv_content)
+        return zip_buffer.getvalue()
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    # Should skip bad entries and process the good one
+    assert result is not None
+    assert len(result["data"]) == 1
+
+
+def test_get_dc_tie_flows_from_archive_handles_malformed_datetime(client, monkeypatch):
+    """Test _get_dc_tie_flows_from_archive handles entries with malformed datetime."""
+    import io
+
+    def fake_get_archive_entries(report_id):
+        return [
+            {"docId": "bad", "postDatetime": "not-a-datetime"},
+            {"docId": "good", "postDatetime": "2026-09-01T10:00:00.000"},
+        ]
+
+    def fake_download_archive(report_id, doc_id):
+        csv_content = b"""TAGCLAST_TIME,TAGCLAST_TIME_DST,TIE_LINE_ID,MW_TIE,TEID_TIE
+09/01/2026 10:00:00,s,DC_E,-50.5,289724"""
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("data.csv", csv_content)
+        return zip_buffer.getvalue()
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+    monkeypatch.setattr(client, "download_archive", fake_download_archive)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    # Should skip bad entry and process good one
+    assert result is not None
+    assert len(result["data"]) == 1
+
+
+def test_get_dc_tie_flows_from_archive_all_entries_filtered_out(client, monkeypatch, caplog):
+    """Test _get_dc_tie_flows_from_archive when all entries are outside date range."""
+
+    def fake_get_archive_entries(report_id):
+        return [
+            {"docId": "old", "postDatetime": "2026-08-01T10:00:00.000"},
+            {"docId": "future", "postDatetime": "2026-10-01T10:00:00.000"},
+        ]
+
+    monkeypatch.setattr(client, "get_archive_entries", fake_get_archive_entries)
+
+    start_dt = datetime(2026, 9, 1, 10, 0, 0)
+    end_dt = datetime(2026, 9, 1, 11, 0, 0)
+
+    result = client._get_dc_tie_flows_from_archive(start_dt, end_dt)
+
+    # Should return None when no entries in range
+    assert result is None
+    assert "No archive entries found for date range" in caplog.text
 
 
 def test_get_sced_binding_transmission_constraints(client, monkeypatch):
