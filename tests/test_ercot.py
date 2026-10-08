@@ -3969,5 +3969,44 @@ def test_get_sced_binding_transmission_constraints(client, monkeypatch):
     )  # constraint violated
 
 
+def test_get_dam_ancillary_service_plan(client, monkeypatch):
+    """Test get_dam_ancillary_service_plan calls the correct endpoint."""
+    called_args = {}
+
+    def fake_get_report_by_timerange(report_path, **kwargs):
+        called_args["report_path"] = report_path
+        called_args["kwargs"] = kwargs
+        return report_payload(
+            [
+                {
+                    "deliveryDate": "2024-01-01",
+                    "hourEnding": "01:00",
+                    "serviceType": "REGUP",
+                    "quantityMW": 500.0,
+                },
+                {
+                    "deliveryDate": "2024-01-01",
+                    "hourEnding": "01:00",
+                    "serviceType": "REGDN",
+                    "quantityMW": 500.0,
+                },
+            ]
+        )
+
+    monkeypatch.setattr(client, "get_report_by_timerange", fake_get_report_by_timerange)
+
+    start_date = date(2024, 1, 1)
+    end_date = date(2024, 1, 1)
+    result = client.get_dam_ancillary_service_plan(start_date, end_date)
+
+    assert called_args["report_path"] == "np4-33-cd/dam_as_plan"
+    assert called_args["kwargs"]["from_param"] == "deliveryDateFrom"
+    assert called_args["kwargs"]["to_param"] == "deliveryDateTo"
+    assert called_args["kwargs"]["param_format"] == "date"
+    assert len(result["data"]) == 2
+    assert result["data"][0]["serviceType"] == "REGUP"
+    assert result["data"][0]["quantityMW"] == 500.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

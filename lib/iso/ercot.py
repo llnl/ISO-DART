@@ -1180,6 +1180,38 @@ class ERCOTClient:
             param_format="date",
         )
 
+    def get_dam_ancillary_service_plan(
+        self,
+        delivery_date_from: DateLike,
+        delivery_date_to: Optional[DateLike] = None,
+        *,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """DAM Ancillary Service Plan (NP4-33-CD): /np4-33-cd/dam_as_plan
+
+        Ancillary Service requirements by type and quantity for each hour.
+        The report shows current day plus next 6 days (7-day rolling window).
+
+        This provides the AS procurement targets/requirements that ERCOT sets
+        for each ancillary service product by hour.
+
+        Returns data for services like REGUP, REGDN, NSPIN, RRS, ECRS, etc.
+
+        Note: This endpoint requires authentication. Historical data beyond
+        the 7-day window may need to be accessed via archive or manual download.
+        """
+        return self.get_report_by_timerange(
+            "np4-33-cd/dam_as_plan",
+            from_param="deliveryDateFrom",
+            to_param="deliveryDateTo",
+            start=delivery_date_from,
+            end=delivery_date_to or delivery_date_from,
+            params=params,
+            fetch_all_pages=fetch_all_pages,
+            param_format="date",
+        )
+
     # ---- Loads ----
 
     def get_actual_system_load_by_weather_zone(

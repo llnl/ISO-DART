@@ -954,7 +954,7 @@ def handle_ercot(args):
                 return False
 
         elif args.data_type == "ancillary-services":
-            # AS types: dam_cleared, dam_offers, sced_offers, resource_capacity
+            # AS types: dam_cleared, dam_offers, sced_offers, resource_capacity, requirements
             as_type = getattr(args, "as_type", "dam_cleared")
 
             if as_type == "resource_capacity":
@@ -962,10 +962,15 @@ def handle_ercot(args):
                 payload = client.get_total_as_resource_capacity(args.start, end_date)
                 return _save(payload, "total_as_resource_capacity")
 
+            if as_type in ["requirements", "plan", "dam_plan"]:
+                logger.info("Downloading ERCOT DAM AS requirements (procurement plan)...")
+                payload = client.get_dam_ancillary_service_plan(args.start, end_date)
+                return _save(payload, "dam_as_requirements")
+
             if not service:
                 logger.error(
                     "--service is required for ERCOT ancillary services "
-                    "(e.g., REGUP, NSPIN, RRSPFR)"
+                    "(e.g., REGUP, NSPIN, RRSPFR). Not required for --as-type requirements"
                 )
                 return False
 
@@ -988,7 +993,7 @@ def handle_ercot(args):
                 logger.error(f"Invalid ERCOT ancillary services type: {as_type}")
                 logger.info(
                     "Available ERCOT AS types: dam_cleared, dam_offers, sced_offers, "
-                    "resource_capacity"
+                    "resource_capacity, requirements"
                 )
                 return False
 
@@ -1567,6 +1572,9 @@ Examples:
             "dam_offers",
             "sced_offers",
             "resource_capacity",
+            "requirements",
+            "plan",
+            "dam_plan",
         ],
         help="For PJM Ancillary Services and ERCOT ancillary services: type of AS data",
     )
@@ -1649,7 +1657,8 @@ Examples:
         "--service",
         help=(
             "For ERCOT ancillary services: service product code "
-            "(e.g., REGUP, REGDN, NSPIN, ECRSM, RRSPFR)"
+            "(e.g., REGUP, REGDN, NSPIN, ECRSM, RRSPFR). "
+            "Not required for --as-type requirements/plan"
         ),
     )
 
