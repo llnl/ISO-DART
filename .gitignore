@@ -42,3 +42,23 @@ docs/sphinx-build.log
 
 # Configuration files
 *.ini
+# Additional patterns
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+
+# Build artifacts
+docs/_build/
+
+# Virtual environments
+venv-*/
+
+# Output directories  
+output/
+output_matches/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
