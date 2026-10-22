@@ -878,14 +878,33 @@ def handle_ercot(args):
         service = getattr(args, "service", None)
 
         if args.data_type == "lmp":
-            # LMP types: dam_hourly, sced, rtd, electrical_bus, settlement_point
+            # LMP types: dam_hourly, dam_settlement_point, sced, rtd, electrical_bus, settlement_point
             lmp_type = getattr(args, "lmp_type", "sced")
             sp_params = {"settlementPoint": settlement_point} if settlement_point else None
 
             if lmp_type == "dam_hourly":
-                logger.info("Downloading ERCOT DAM Hourly LMPs...")
+                logger.info("Downloading ERCOT DAM Hourly LMPs (by bus)...")
                 payload = client.get_dam_hourly_lmps(args.start, end_date)
                 return _save(payload, "dam_hourly_lmp")
+
+            elif lmp_type == "dam_settlement_point":
+                logger.info(
+                    "Downloading ERCOT DAM Settlement Point Prices (by load zone/hub/node)..."
+                )
+                sp_name = getattr(args, "settlement_point_name", None)
+                sp_type = getattr(args, "settlement_point_type", None)
+                payload = client.get_dam_settlement_point_prices(
+                    args.start,
+                    end_date,
+                    settlement_point_name=sp_name,
+                    settlement_point_type=sp_type,
+                )
+                label = "dam_settlement_point_prices"
+                if sp_name:
+                    label += f"_{sp_name.lower()}"
+                elif sp_type:
+                    label += f"_{sp_type.lower()}"
+                return _save(payload, label)
 
             elif lmp_type == "sced":
                 # SCED uses timestamp params - convert date to datetime for full day coverage
@@ -909,15 +928,15 @@ def handle_ercot(args):
                 return _save(payload, "sced_lmp_electrical_bus")
 
             elif lmp_type == "settlement_point":
-                logger.info("Downloading ERCOT Settlement Point Prices...")
+                logger.info("Downloading ERCOT Settlement Point Prices (15-minute intervals)...")
                 payload = client.get_settlement_point_prices(args.start, end_date, params=sp_params)
                 return _save(payload, "settlement_point_prices")
 
             else:
                 logger.error(f"Invalid ERCOT LMP type: {lmp_type}")
                 logger.info(
-                    "Available ERCOT LMP types: dam_hourly, sced, rtd, electrical_bus, "
-                    "settlement_point"
+                    "Available ERCOT LMP types: dam_hourly, dam_settlement_point, sced, rtd, "
+                    "electrical_bus, settlement_point"
                 )
                 return False
 
@@ -1370,6 +1389,12 @@ Examples:
   # Weather data
   python isodart.py --data-type weather --state CA --start 2024-01-01 --duration 30
 
+  # ERCOT DAM Settlement Point Prices for Houston load zone
+  python isodart.py --iso ercot --data-type lmp --lmp-type dam_settlement_point --settlement-point-name LZ_HOUSTON --start 2024-01-01 --duration 7
+
+  # ERCOT DAM Settlement Point Prices for all load zones
+  python isodart.py --iso ercot --data-type lmp --lmp-type dam_settlement_point --settlement-point-type LZ --start 2024-01-01 --duration 7
+
   # ERCOT SCED LMPs (node/zone/hub) for the North hub
   python isodart.py --iso ercot --data-type lmp --lmp-type sced --settlement-point HB_NORTH --start 2024-01-01 --duration 7
 
@@ -1442,6 +1467,7 @@ Examples:
             "rt_5min",
             "rt_hourly",
             "dam_hourly",
+            "dam_settlement_point",
             "sced",
             "rtd",
             "electrical_bus",
@@ -1648,8 +1674,27 @@ Examples:
     parser.add_argument(
         "--settlement-point",
         help=(
-            "For ERCOT LMP / Settlement Point Prices: settlement point to filter by "
+            "For ERCOT SCED/RTD LMPs: settlement point to filter by "
             "(e.g., HB_NORTH). Downloads all points if not specified."
+        ),
+    )
+
+    parser.add_argument(
+        "--settlement-point-name",
+        help=(
+            "For ERCOT DAM Settlement Point Prices (--lmp-type dam_settlement_point): "
+            "settlement point name to filter by (e.g., LZ_HOUSTON, HB_NORTH, LZ_SOUTH). "
+            "Downloads all points if not specified."
+        ),
+    )
+
+    parser.add_argument(
+        "--settlement-point-type",
+        choices=["LZ", "HB", "RN"],
+        help=(
+            "For ERCOT DAM Settlement Point Prices (--lmp-type dam_settlement_point): "
+            "filter by settlement point type. LZ=Load Zone, HB=Hub, RN=Resource Node. "
+            "Downloads all types if not specified."
         ),
     )
 

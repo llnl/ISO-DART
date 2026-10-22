@@ -824,6 +824,111 @@ class ERCOTClient:
             param_format="date",
         )
 
+    def get_dam_settlement_point_prices(
+        self,
+        delivery_date_from: DateLike,
+        delivery_date_to: Optional[DateLike] = None,
+        *,
+        settlement_point_name: Optional[str] = None,
+        settlement_point_type: Optional[str] = None,
+        hour_ending: Optional[int] = None,
+        lmp_from: Optional[float] = None,
+        lmp_to: Optional[float] = None,
+        dst_flag: Optional[bool] = None,
+        params: Optional[Params] = None,
+        fetch_all_pages: bool = True,
+    ) -> Optional[Json]:
+        """DAM Settlement Point Prices (NP4-190-CD): /np4-190-cd/dam_stlmnt_pnt_prices
+
+        Day-Ahead Market settlement point prices (LMPs) by load zone, hub, or resource node.
+
+        Parameters
+        ----------
+        delivery_date_from : DateLike
+            Start delivery date (YYYY-MM-DD)
+        delivery_date_to : DateLike, optional
+            End delivery date (YYYY-MM-DD). Defaults to delivery_date_from.
+        settlement_point_name : str, optional
+            Filter by settlement point name (e.g., 'LZ_HOUSTON', 'HB_NORTH', 'LZ_SOUTH')
+        settlement_point_type : str, optional
+            Filter by type prefix: 'LZ' (Load Zone), 'HB' (Hub), 'RN' (Resource Node).
+            Note: This is a client-side filter that downloads all data and filters by
+            settlement point name prefix.
+        hour_ending : int, optional
+            Filter by hour ending (1-25, where 25 is the repeated 2:00 AM hour during DST fall-back)
+        lmp_from : float, optional
+            Minimum LMP price filter
+        lmp_to : float, optional
+            Maximum LMP price filter
+        dst_flag : bool, optional
+            DST flag filter
+        params : dict, optional
+            Additional query parameters
+        fetch_all_pages : bool, default True
+            Whether to fetch all pages automatically
+
+        Returns
+        -------
+        Optional[Json]
+            Standard Report payload with fields:
+                deliveryDate, hourEnding, settlementPoint, settlementPointPrice, DSTFlag
+
+        Examples
+        --------
+        Get Houston load zone DAM LMPs for a week:
+        >>> client.get_dam_settlement_point_prices(
+        ...     delivery_date_from="2025-01-01",
+        ...     delivery_date_to="2025-01-07",
+        ...     settlement_point_name="LZ_HOUSTON"
+        ... )
+
+        Get all load zone prices for a single day (client-side filtered):
+        >>> client.get_dam_settlement_point_prices(
+        ...     delivery_date_from="2025-01-01",
+        ...     settlement_point_type="LZ"
+        ... )
+        """
+        p: Params = dict(params or {})
+
+        # Use settlementPoint parameter (API accepts this)
+        if settlement_point_name is not None:
+            p["settlementPoint"] = settlement_point_name
+        if hour_ending is not None:
+            p["hourEnding"] = hour_ending
+        if lmp_from is not None:
+            p["settlementPointPriceFrom"] = lmp_from
+        if lmp_to is not None:
+            p["settlementPointPriceTo"] = lmp_to
+        if dst_flag is not None:
+            p["DSTFlag"] = dst_flag
+
+        payload = self.get_report_by_timerange(
+            "np4-190-cd/dam_stlmnt_pnt_prices",
+            from_param="deliveryDateFrom",
+            to_param="deliveryDateTo",
+            start=delivery_date_from,
+            end=delivery_date_to or delivery_date_from,
+            params=p,
+            fetch_all_pages=fetch_all_pages,
+            param_format="date",
+        )
+
+        # If settlement_point_type is specified, filter client-side by prefix
+        if payload and settlement_point_type:
+            data = payload.get("data", [])
+            filtered_data = [
+                row
+                for row in data
+                if row.get("settlementPoint", "").startswith(f"{settlement_point_type}_")
+            ]
+            payload["data"] = filtered_data
+            # Update metadata
+            if "_meta" in payload:
+                payload["_meta"]["totalRecords"] = len(filtered_data)
+                payload["_meta"]["pageSize"] = len(filtered_data)
+
+        return payload
+
     def get_sced_lmps_node_zone_hub(
         self,
         start: DateLike,

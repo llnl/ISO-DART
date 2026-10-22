@@ -1860,6 +1860,194 @@ def test_get_settlement_point_prices(client, monkeypatch):
     assert captured["params"]["settlementPoint"] == "HB_NORTH"
 
 
+def test_get_dam_settlement_point_prices(client, monkeypatch):
+    """Test DAM Settlement Point Prices (NP4-190-CD) basic call."""
+    captured = {}
+
+    payload = report_payload(
+        [
+            {
+                "deliveryDate": "2025-01-01",
+                "hourEnding": "01:00",
+                "settlementPoint": "LZ_HOUSTON",
+                "settlementPointPrice": 30.0,
+            }
+        ]
+    )
+
+    def fake_request(method, url, params=None, headers=None, timeout=None, stream=False):
+        captured["url"] = url
+        captured["params"] = dict(params or {})
+        return FakeResponse(status_code=200, json_data=payload)
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    out = client.get_dam_settlement_point_prices(date(2025, 1, 1), date(2025, 1, 2))
+    assert out is not None
+    assert captured["url"].endswith("/np4-190-cd/dam_stlmnt_pnt_prices")
+    assert captured["params"]["deliveryDateFrom"] == "2025-01-01"
+    assert captured["params"]["deliveryDateTo"] == "2025-01-02"
+
+
+def test_get_dam_settlement_point_prices_with_settlement_point_name(client, monkeypatch):
+    """Test DAM Settlement Point Prices with specific settlement point name filter."""
+    captured = {}
+
+    payload = report_payload(
+        [
+            {
+                "deliveryDate": "2025-01-01",
+                "hourEnding": "01:00",
+                "settlementPoint": "LZ_HOUSTON",
+                "settlementPointPrice": 30.0,
+            }
+        ]
+    )
+
+    def fake_request(method, url, params=None, headers=None, timeout=None, stream=False):
+        captured["params"] = dict(params or {})
+        return FakeResponse(status_code=200, json_data=payload)
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    client.get_dam_settlement_point_prices(
+        date(2025, 1, 1), date(2025, 1, 2), settlement_point_name="LZ_HOUSTON"
+    )
+
+    assert captured["params"]["settlementPoint"] == "LZ_HOUSTON"
+
+
+def test_get_dam_settlement_point_prices_with_filters(client, monkeypatch):
+    """Test DAM Settlement Point Prices with all optional filters."""
+    captured = {}
+    payload = report_payload([{}])
+
+    def fake_request(method, url, params=None, headers=None, timeout=None, stream=False):
+        captured["params"] = dict(params or {})
+        return FakeResponse(status_code=200, json_data=payload)
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    client.get_dam_settlement_point_prices(
+        date(2025, 1, 1),
+        settlement_point_name="LZ_HOUSTON",
+        hour_ending=12,
+        lmp_from=10.0,
+        lmp_to=100.0,
+        dst_flag=True,
+    )
+
+    p = captured["params"]
+    assert p["settlementPoint"] == "LZ_HOUSTON"
+    assert p["hourEnding"] == 12
+    assert p["settlementPointPriceFrom"] == 10.0
+    assert p["settlementPointPriceTo"] == 100.0
+    assert p["DSTFlag"] is True
+
+
+def test_get_dam_settlement_point_prices_client_side_filter_by_type(client, monkeypatch):
+    """Test DAM Settlement Point Prices with client-side type filtering."""
+    payload = report_payload(
+        [
+            {"settlementPoint": "LZ_HOUSTON", "settlementPointPrice": 30.0},
+            {"settlementPoint": "LZ_NORTH", "settlementPointPrice": 25.0},
+            {"settlementPoint": "HB_NORTH", "settlementPointPrice": 28.0},
+            {"settlementPoint": "RN_RESOURCE1", "settlementPointPrice": 32.0},
+        ]
+    )
+
+    def fake_request(method, url, params=None, headers=None, timeout=None, stream=False):
+        return FakeResponse(status_code=200, json_data=payload)
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    # Filter to only load zones (LZ_*)
+    out = client.get_dam_settlement_point_prices(date(2025, 1, 1), settlement_point_type="LZ")
+
+    assert out is not None
+    assert len(out["data"]) == 2
+    assert all(r["settlementPoint"].startswith("LZ_") for r in out["data"])
+    assert out["_meta"]["totalRecords"] == 2
+
+
+def test_get_dam_settlement_point_prices_client_side_filter_by_hub(client, monkeypatch):
+    """Test DAM Settlement Point Prices filtering to only hubs."""
+    payload = report_payload(
+        [
+            {"settlementPoint": "LZ_HOUSTON", "settlementPointPrice": 30.0},
+            {"settlementPoint": "HB_NORTH", "settlementPointPrice": 28.0},
+            {"settlementPoint": "HB_SOUTH", "settlementPointPrice": 27.0},
+        ]
+    )
+
+    def fake_request(method, url, params=None, headers=None, timeout=None, stream=False):
+        return FakeResponse(status_code=200, json_data=payload)
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    # Filter to only hubs (HB_*)
+    out = client.get_dam_settlement_point_prices(date(2025, 1, 1), settlement_point_type="HB")
+
+    assert out is not None
+    assert len(out["data"]) == 2
+    assert all(r["settlementPoint"].startswith("HB_") for r in out["data"])
+
+
+def test_get_dam_settlement_point_prices_client_side_filter_empty_result(client, monkeypatch):
+    """Test DAM Settlement Point Prices when client-side filter matches nothing."""
+    payload = report_payload(
+        [
+            {"settlementPoint": "LZ_HOUSTON", "settlementPointPrice": 30.0},
+            {"settlementPoint": "LZ_NORTH", "settlementPointPrice": 25.0},
+        ]
+    )
+
+    def fake_request(method, url, params=None, headers=None, timeout=None, stream=False):
+        return FakeResponse(status_code=200, json_data=payload)
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    # Filter to resource nodes, but none exist in the data
+    out = client.get_dam_settlement_point_prices(date(2025, 1, 1), settlement_point_type="RN")
+
+    assert out is not None
+    assert len(out["data"]) == 0
+    assert out["_meta"]["totalRecords"] == 0
+
+
+def test_get_dam_settlement_point_prices_no_type_filter(client, monkeypatch):
+    """Test DAM Settlement Point Prices without type filter returns all data."""
+    payload = report_payload(
+        [
+            {"settlementPoint": "LZ_HOUSTON", "settlementPointPrice": 30.0},
+            {"settlementPoint": "HB_NORTH", "settlementPointPrice": 28.0},
+            {"settlementPoint": "RN_RESOURCE1", "settlementPointPrice": 32.0},
+        ]
+    )
+
+    def fake_request(method, url, params=None, headers=None, timeout=None, stream=False):
+        return FakeResponse(status_code=200, json_data=payload)
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    out = client.get_dam_settlement_point_prices(date(2025, 1, 1))
+
+    assert out is not None
+    assert len(out["data"]) == 3
+
+
+def test_get_dam_settlement_point_prices_returns_none_on_failure(client, monkeypatch):
+    """Test DAM Settlement Point Prices returns None when request fails."""
+
+    def fake_request(*args, **kwargs):
+        return FakeResponse(status_code=404, json_data={})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    out = client.get_dam_settlement_point_prices(date(2025, 1, 1))
+    assert out is None
+
+
 def test_get_dam_cleared_ancillary_service(client, monkeypatch):
     captured = {}
 
